@@ -4,13 +4,13 @@ edges-ml  –  Multi-code MHD simulation dataset builder for machine learning.
 This is the main entry point / workflow script. Adapter classes for individual
 simulation codes live in their own modules:
 
-    edges-ml/m3dc1_adapter.py   ->  M3DC1Adapter
-    edges-ml/nimrod_adapter.py  ->  NIMRODAdapter
+    edges_ml/m3dc1_adapter.py   ->  M3DC1Adapter
+    edges_ml/nimrod_adapter.py  ->  NIMRODAdapter
 
 Shared utilities, label registries, and IMAS helpers live in:
 
-    edges-ml/utils.py
-    edges-ml/base.py
+    edges_ml/utils.py
+    edges_ml/base.py
 """
 
 import os

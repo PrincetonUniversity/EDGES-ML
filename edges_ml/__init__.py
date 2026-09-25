@@ -8,7 +8,7 @@ Public API
     from edges_ml import SimulationAdapter
 """
 
-from .edges-ml import build_dataset, group_simulation_directories
+from .edges_ml import build_dataset, group_simulation_directories
 from .base import SimulationAdapter
 from .m3dc1_adapter import M3DC1Adapter
 from .nimrod_adapter import NIMRODAdapter
