@@ -6,12 +6,14 @@ Public API
     from edges_ml import build_dataset
     from edges_ml import M3DC1Adapter, NIMRODAdapter
     from edges_ml import SimulationAdapter
+    from edges_ml import GridSpec
 """
 
 from .edges_ml import build_dataset, group_simulation_directories
 from .base import SimulationAdapter
 from .m3dc1_adapter import M3DC1Adapter
 from .nimrod_adapter import NIMRODAdapter
+from .utils import GridSpec
 
 __all__ = [
     "build_dataset",
@@ -19,4 +21,5 @@ __all__ = [
     "SimulationAdapter",
     "M3DC1Adapter",
     "NIMRODAdapter",
+    "GridSpec",
 ]
