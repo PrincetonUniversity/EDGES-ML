@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "edges-ml"
+version = "0.1.0"
+description = "A multi-code MHD simulation dataset builder for machine learning applications."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dependencies = [
+    "numpy",
+    "h5py",
+    "matplotlib",
+    "termcolor",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+m3dc1  = ["fpy"]
+nimrod = ["nimpy"]
+imas   = ["imas"]
+adios2 = ["adios2"]
+all    = ["fpy", "nimpy", "imas", "adios2"]
+
+[project.scripts]
+edges-build-dataset = "edges_ml.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["edges_ml*"]
+
