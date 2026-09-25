@@ -1,0 +1,33 @@
+# Conda environment for edges-ml with NIMROD support.
+#
+# The 'nimpy' package is NOT on conda-forge or PyPI.
+# Install it manually into this environment after creation:
+#
+#   conda env create -f environment_nimrod.yml
+#   conda activate edges-ml-nimrod
+#   pip install /path/to/nimpy              # provides nimpy.eval_nimrod
+#   pip install -e /path/to/edges-ml        # install edges-ml itself
+#
+# NIMROD IMAS conversion additionally requires the nimrod2imas scripts
+# (dump2imas.py, input2imas.py, gamma2imas.py) and imas-python.
+# Point edges-ml at them via:
+#   config["imas"]["nimrod2imas_path"] = "/path/to/nimrod2imas"
+# or export $NIMROD2IMAS_DIR before running.
+
+name: edges-ml-nimrod
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python>=3.9
+  - numpy
+  - h5py
+  - matplotlib
+  - termcolor
+  - pyyaml
+  - pip
+  - pip:
+    # edges-ml itself (editable install from repo root)
+    - -e .
