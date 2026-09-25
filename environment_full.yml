@@ -1,4 +1,4 @@
-# Conda environment for edges-ml with full support:
+# Conda environment for edges_ml with full support:
 #   M3D-C1  (fpy / m3dc1)
 #   NIMROD  (nimpy)
 #   ADIOS2  (adios2)
@@ -8,7 +8,7 @@
 # after creating the environment:
 #
 #   conda env create -f environment_full.yml
-#   conda activate edges-ml-full
+#   conda activate edges_ml-full
 #
 #   # M3D-C1 Python bindings (fusion-io + m3dc1 package)
 #   pip install /path/to/fusion-io/python
@@ -21,10 +21,10 @@
 #   pip install /path/to/imas-python
 #   # OR load via environment modules: module load imas
 #
-#   # edges-ml itself
-#   pip install -e /path/to/edges-ml
+#   # edges_ml itself
+#   pip install -e /path/to/edges_ml
 
-name: edges-ml-full
+name: edges_ml-full
 
 channels:
   - conda-forge
@@ -41,5 +41,5 @@ dependencies:
   - adios2
   - pip
   - pip:
-    # edges-ml itself (editable install from repo root)
+    # edges_ml itself (editable install from repo root)
     - -e .

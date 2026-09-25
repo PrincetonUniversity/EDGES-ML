@@ -1,5 +1,5 @@
 """
-edges-ml  –  Multi-code MHD simulation dataset builder for machine learning.
+edges_ml  –  Multi-code MHD simulation dataset builder for machine learning.
 
 Public API
 ----------

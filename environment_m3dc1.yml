@@ -1,15 +1,15 @@
-# Conda environment for edges-ml with M3D-C1 support.
+# Conda environment for edges_ml with M3D-C1 support.
 #
 # The 'fpy' (fusion-io) and 'm3dc1' packages are NOT on conda-forge or PyPI.
 # Install them manually into this environment after creation:
 #
 #   conda env create -f environment_m3dc1.yml
-#   conda activate edges-ml-m3dc1
+#   conda activate edges_ml-m3dc1
 #   pip install /path/to/fusion-io/python   # provides fpy
 #   pip install /path/to/m3dc1/python       # provides m3dc1.*
-#   pip install -e /path/to/edges-ml        # install edges-ml itself
+#   pip install -e /path/to/edges_ml        # install edges_ml itself
 
-name: edges-ml-m3dc1
+name: edges_ml-m3dc1
 
 channels:
   - conda-forge
@@ -24,5 +24,5 @@ dependencies:
   - pyyaml
   - pip
   - pip:
-    # edges-ml itself (editable install from repo root)
+    # edges_ml itself (editable install from repo root)
     - -e .
