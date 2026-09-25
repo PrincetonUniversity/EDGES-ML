@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "edges-ml"
@@ -30,4 +30,3 @@ edges-build-dataset = "edges_ml.cli:main"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["edges_ml*"]
-
