@@ -14,10 +14,10 @@ demand, or it can make use of the IMAS schema as defined by the IMAS Data Dictio
 
 ## Supported Codes
 
-| Code      | Adapter                          | Key dependency          |
-|-----------|----------------------------------|-------------------------|
-| M3D-C1    | `edges_ml.adapters.m3dc1`        | `fpy` (fusion-io)       |
-| NIMROD    | `edges_ml.adapters.nimrod`       | `nimpy`                 |
+| Code      | Adapter class                              | Key dependency          |
+|-----------|--------------------------------------------|-------------------------|
+| M3D-C1    | `edges_ml.m3dc1_adapter.M3DC1Adapter`      | `fpy` (fusion-io)       |
+| NIMROD    | `edges_ml.nimrod_adapter.NIMRODAdapter`    | `nimpy`                 |
 
 ---
 
@@ -47,12 +47,39 @@ pip install "edges-ml[all]"
 
 ## External Dependencies (not on PyPI)
 
-| Dependency    | How to provide                                                                 |
-|---------------|--------------------------------------------------------------------------------|
-| `fpy`         | Install fusion-io with Python bindings; ensure `fpy` is importable.           |
-| `nimpy`       | Install the nimpy package into your Python environment.                        |
-| `nimrod2imas` | Clone from GitHub; set `config["imas"]["nimrod2imas_path"]` or `$NIMROD2IMAS_DIR`. |
-| `imas`        | Install imas-python; set `config["imas"]["python"]` if in a separate env.     |
+Some functionality requires external packages that are not available on PyPI and must be
+installed separately before use.
+
+### `fpy` (fusion-io)
+
+Install fusion-io with Python bindings and ensure that `fpy.py` is importable from your
+Python environment (`import fpy`). The fusion-io source code is available at:
+
+- https://github.com/nferraro/fusion-io
+
+### `nimpy`
+
+Install the nimpy package into your Python environment. The nimpy package is available at:
+
+- Source: https://gitlab.com/NIMRODteam/open/nimpy/
+- Documentation (including installation instructions): https://nimrodteam.gitlab.io/open/nimpy/index.html
+
+### `nimrod2imas`
+
+Install the nimrod2imas package into your Python environment. Like nimpy it can be installed as a
+regular Python package from its source repository using `pip install -e`:
+
+- Source: https://github.com/PrincetonUniversity/nimrod2imas
+
+### `imas`
+
+Install the imas package into your Python environment. This package can be readily
+installed via pip:
+
+```bash
+pip install imas-python
+```
+Documentation is available at https://imas-python.readthedocs.io/en/stable/index.html
 
 ---
 
@@ -121,7 +148,7 @@ Key top-level config keys:
 
 ---
 
-## Output Schema (HDF5)
+## Output Schema
 
 ```
 /metadata/
@@ -145,3 +172,5 @@ Key top-level config keys:
 /perturbations/<nXX>/2d_fields/
 /perturbations/<nXX>/3d_fields/
 ```
+
+For information on the IMAS schema please see https://imas-data-dictionary.readthedocs.io/en/latest/reference_ids.html
