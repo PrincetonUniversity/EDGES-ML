@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -27,6 +27,16 @@ all    = ["fpy", "nimpy", "imas", "adios2"]
 [project.scripts]
 edges-build-dataset = "edges_ml.cli:main"
 
+[tool.setuptools]
+include-package-data = true
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["edges_ml*"]
+exclude = ["build*", "dist*", "tests*", "docs*"]
+# IMPORTANT: without this, setuptools may pick up `edges_ml/` as an implicit
+# namespace package.  An editable install then bakes that decision into the
+# generated __editable___edges_ml_*_finder.py, so `import edges_ml` resolves to
+# a location-less namespace module (__file__ is None, __init__.py never runs)
+# and every top-level name such as GridSpec becomes unimportable.
+namespaces = false

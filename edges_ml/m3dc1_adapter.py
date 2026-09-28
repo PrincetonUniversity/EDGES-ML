@@ -489,24 +489,28 @@ class M3DC1Adapter(SimulationAdapter):
 
         for i, ts in enumerate(time_slices):
             sim = self._get_eq_sim() if ts == -1 else self._get_time_sim(ts)
+            if sim is None:
+                printwarn(f"Could not load simulation object for time slice {ts}; skipping.")
+                continue
+
             h5file = sim._all_attrs
-            if sim is not None:
-                if ts == -1:
-                    fname = "equilibrium.h5"
-                else:
-                    fname = f"time_{ts:03d}.h5"
 
-                file_path = str(file_dir / fname)
+            if ts == -1:
+                fname = "equilibrium.h5"
+            else:
+                fname = f"time_{ts:03d}.h5"
 
-                try:
-                    meta["simulation_time"][i] = get_time_of_slice(ts, sim=sim, filename=c1_file, units='m3dc1')
-                except Exception as e:
-                    printerr(f"Error extracting simulation_time for slice {ts}: {e}")
+            file_path = str(file_dir / fname)
 
-                try:
-                    meta["simulation_time_step"][i] = int(readParameter('ntimestep', h5file=h5file))
-                except Exception as e:
-                    printerr(f"Error extracting ntimestep for slice {ts} from {fname}: {e}")
+            try:
+                meta["simulation_time"][i] = get_time_of_slice(ts, sim=sim, filename=c1_file, units='m3dc1')
+            except Exception as e:
+                printerr(f"Error extracting simulation_time for slice {ts}: {e}")
+
+            try:
+                meta["simulation_time_step"][i] = int(readParameter('ntimestep', h5file=h5file))
+            except Exception as e:
+                printerr(f"Error extracting ntimestep for slice {ts} from {fname}: {e}")
 
         return meta
 
