@@ -23,7 +23,9 @@ from termcolor import colored
 # ---------------------------------------------------------------------------
 try:
     from nimpy.eval_nimrod import EvalNimrod
+    _NIMPY_AVAILABLE = True
 except ImportError:
+    _NIMPY_AVAILABLE = False
     print("Warning: nimpy module not found. NIMROD extraction will fail if called.")
 
 from .base import SimulationAdapter
@@ -866,6 +868,10 @@ class NIMRODAdapter(SimulationAdapter):
             return np.array([])
 
     def get_2d_field(self, name, grid_spec, units, time=-1):
+        if not _NIMPY_AVAILABLE:
+            printwarn("nimpy is not available; cannot evaluate NIMROD fields.")
+            return np.array([])
+
         nim_field = self._map_nimrod_field(name)
         if not nim_field:
             printwarn(f"Field '{name}' is not currently mapped for NIMROD extraction.")
@@ -911,6 +917,10 @@ class NIMRODAdapter(SimulationAdapter):
             os.chdir(original_cwd)
 
     def get_3d_field(self, name, grid_spec, units, time=-1):
+        if not _NIMPY_AVAILABLE:
+            printwarn("nimpy is not available; cannot evaluate NIMROD fields.")
+            return np.array([])
+
         nim_field = self._map_nimrod_field(name)
         if not nim_field:
             printwarn(f"Field '{name}' is not currently mapped for NIMROD extraction.")
@@ -1014,6 +1024,10 @@ class NIMRODAdapter(SimulationAdapter):
         """
         Evaluates the field at the last dump file in the given mode directory (finite time).
         """
+        if not _NIMPY_AVAILABLE:
+            printwarn("nimpy is not available; cannot evaluate NIMROD fields.")
+            return np.array([])
+
         nim_field = self._map_nimrod_field(name)
         if not nim_field:
             printwarn(f"Field '{name}' is not currently mapped for NIMROD extraction.")
@@ -1061,6 +1075,10 @@ class NIMRODAdapter(SimulationAdapter):
         """
         Evaluates the field at the last dump file in the given mode directory (finite time).
         """
+        if not _NIMPY_AVAILABLE:
+            printwarn("nimpy is not available; cannot evaluate NIMROD fields.")
+            return np.array([])
+
         nim_field = self._map_nimrod_field(name)
         if not nim_field:
             printwarn(f"Field '{name}' is not currently mapped for NIMROD extraction.")

@@ -30,7 +30,9 @@ try:
     from m3dc1.convert2imas_imaspy import convert2imas_imaspy
     from m3dc1.get_time_of_slice import get_time_of_slice
     from m3dc1.read_h5 import readParameter
+    _M3DC1_AVAILABLE = True
 except ImportError:
+    _M3DC1_AVAILABLE = False
     print("Warning: fpy or m3dc1 modules not found. M3D-C1 extraction will fail if called.")
 
 from .base import SimulationAdapter
@@ -64,16 +66,17 @@ class M3DC1Adapter(SimulationAdapter):
 
         # Look for the Gamma growth rate file inside the parent model directory
         self.gamma_data = None
-        for f in self.model_dir.iterdir():
-            if f.is_file() and f.suffix in ['.txt', '.dat', '.out', '']:
-                try:
-                    with open(f, 'r') as tmp:
-                        first_lines = "".join([next(tmp) for _ in range(5)])
-                    if 'gamma' in first_lines and 'sig_gamma' in first_lines:
-                        self.gamma_data = Gamma_file(str(f))
-                        break
-                except Exception:
-                    pass
+        if _M3DC1_AVAILABLE:
+            for f in self.model_dir.iterdir():
+                if f.is_file() and f.suffix in ['.txt', '.dat', '.out', '']:
+                    try:
+                        with open(f, 'r') as tmp:
+                            first_lines = "".join([next(tmp) for _ in range(5)])
+                        if 'gamma' in first_lines and 'sig_gamma' in first_lines:
+                            self.gamma_data = Gamma_file(str(f))
+                            break
+                    except Exception:
+                        pass
 
     def _get_eq_sim(self):
         """
