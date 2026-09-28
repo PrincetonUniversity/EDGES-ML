@@ -3,9 +3,9 @@ requires = ["setuptools>=64", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "edges-ml"
+name = "EDGES-ML"
 version = "0.1.0"
-description = "A multi-code MHD simulation dataset builder for machine learning applications."
+description = "Extract data from extended-MHD simulation codes for use in machine learning applications."
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
@@ -34,9 +34,6 @@ include-package-data = true
 where = ["."]
 include = ["edges_ml*"]
 exclude = ["build*", "dist*", "tests*", "docs*"]
-# IMPORTANT: without this, setuptools may pick up `edges_ml/` as an implicit
-# namespace package.  An editable install then bakes that decision into the
-# generated __editable___edges_ml_*_finder.py, so `import edges_ml` resolves to
-# a location-less namespace module (__file__ is None, __init__.py never runs)
-# and every top-level name such as GridSpec becomes unimportable.
+# Without the following line, setuptools may pick up 'edges_ml/' as an implicit
+# namespace package.
 namespaces = false

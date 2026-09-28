@@ -1,11 +1,14 @@
-# edges-ml
+# edges_ml
 
-**edges-ml** is a standalone Python package for building machine-learning-ready datasets
-from MHD simulation codes (M3D-C1, NIMROD, and others).
+**edges_ml** is a standalone Python package for building machine-learning-ready datasets
+from MHD simulation codes. Currently it supports M3D-C1 and NIMROD, but its design allows
+for other codes to be added in the future.
 
 It acts as a neutral orchestration layer: it discovers simulation output directories,
-extracts equilibrium fields, flux averages, time traces, and mode eigenfunctions, and
-writes them to HDF5 (or ADIOS2 BP) files in a consistent schema.
+extracts fields on spatial grids, flux averages, time traces, and mode eigenfunctions, and
+writes them to HDF5 or ADIOS2 BP files in a consistent schema. It supports either a custom
+data scheme that was developed specifically for extended-MHD codes and can be expanded on
+demand, or it can make use of the IMAS schema as defined by the IMAS Data Dictionary.
 
 ---
 
@@ -15,8 +18,6 @@ writes them to HDF5 (or ADIOS2 BP) files in a consistent schema.
 |-----------|----------------------------------|-------------------------|
 | M3D-C1    | `edges_ml.adapters.m3dc1`        | `fpy` (fusion-io)       |
 | NIMROD    | `edges_ml.adapters.nimrod`       | `nimpy`                 |
-
-IMAS output is supported for both codes via optional IMAS backends.
 
 ---
 
