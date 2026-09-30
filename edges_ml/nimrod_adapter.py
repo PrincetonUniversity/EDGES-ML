@@ -3,51 +3,171 @@ NIMROD adapter for edges-ml.
 
 Contains the NIMRODAdapter class, which implements the SimulationAdapter
 interface for NIMROD HDF5 dump files.
+
+External NIMROD tooling used here:
+    nimpy.eval_nimrod.EvalNimrod / EvalGrid   -> point-wise field evaluation
+    nimpy.fsa.FSA / find_pf_null / FSAInput   -> flux surface averages, q, fluxes
+    nimpy.read_bin.readBin                    -> discharge.bin / energy.bin traces
+    nimrod2imas (dump2imas/input2imas/gamma2imas) -> IMAS conversion
 """
 
 import os
 import re
 import sys
-import shlex
 import shutil
-import importlib
+import hashlib
+import contextlib
 import subprocess
 import numpy as np
 import h5py
 from pathlib import Path
 
-from termcolor import colored
-
 # ---------------------------------------------------------------------------
 # EXTERNAL DEPENDENCIES
 # ---------------------------------------------------------------------------
 try:
-    from nimpy.eval_nimrod import EvalNimrod
-    _NIMPY_AVAILABLE = True
+    from nimpy.eval_nimrod import EvalNimrod, EvalGrid
+    _NIMPY_EVAL_AVAILABLE = True
 except ImportError:
-    _NIMPY_AVAILABLE = False
-    print("Warning: nimpy module not found. NIMROD extraction will fail if called.")
+    _NIMPY_EVAL_AVAILABLE = False
+    print("Warning: nimpy.eval_nimrod not found. NIMROD field extraction will be skipped.")
+
+try:
+    from nimpy.fsa import FSA, find_pf_null, FSAInput
+    _NIMPY_FSA_AVAILABLE = True
+except ImportError:
+    _NIMPY_FSA_AVAILABLE = False
+    print("Warning: nimpy.fsa not found. NIMROD flux averages / global parameters will be skipped.")
+
+try:
+    from nimpy.read_bin import readBin
+    _NIMPY_READBIN_AVAILABLE = True
+except ImportError:
+    _NIMPY_READBIN_AVAILABLE = False
+    print("Warning: nimpy.read_bin not found. NIMROD time traces will be skipped.")
+
+# Kept for backwards compatibility with earlier revisions of this module.
+_NIMPY_AVAILABLE = _NIMPY_EVAL_AVAILABLE
 
 from .base import SimulationAdapter
 from .utils import (
     printwarn, printerr, printnote,
     compute_file_hash, auto_cast,
+    expand_request,
     GridSpec,
+    AVAILABLE_FLUX_AVERAGES,
     _infer_machine_and_shot, _allocate_imas_run, _imas_entry_dir,
-    _imas_dd_version_dir,
     _prepare_nimrod2imas_runtime, _nimrod2imas_tool_available,
     _run_nimrod2imas_tool, _options_dict_to_cli,
-    _record_imas_manifest,
-    _GEQDSK_PATTERNS, _PEQDSK_PATTERNS,
-    _is_geqdsk_name, _is_peqdsk_name,
 )
 
+
+# ===========================================================================
+# SMALL HELPERS
+# ===========================================================================
+
+@contextlib.contextmanager
+def _pushd(path):
+    """Temporarily change the working directory (nimpy reads nimrod.in from cwd)."""
+    prev = os.getcwd()
+    try:
+        os.chdir(str(path))
+        yield
+    finally:
+        try:
+            os.chdir(prev)
+        except Exception:
+            pass
+
+
+def _finite(value, default=np.nan):
+    try:
+        v = float(value)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
+
+
+def _trapz_profile(y, x):
+    """Cumulative trapezoidal integral of y over a (possibly reversed/negative) x."""
+    y = np.asarray(y, dtype=float)
+    x = np.asarray(x, dtype=float)
+    if y.size < 2 or x.size != y.size:
+        return np.zeros_like(y)
+    xx = x - x[0]
+    if xx[-1] < 0:
+        xx = -xx
+    out = np.zeros_like(y)
+    out[1:] = np.cumsum(0.5 * (y[1:] + y[:-1]) * np.diff(xx))
+    return out
+
+
+# ===========================================================================
+# ADAPTER
+# ===========================================================================
 
 class NIMRODAdapter(SimulationAdapter):
     CODE_NAME = "NIMROD"
 
     # Sign flip for the toroidal (phi) component to match M3D-C1 conventions.
     PHI_SIGN_FLIP = -1.0
+
+    MU0 = 4.0e-7 * np.pi
+
+    # --- field registries -------------------------------------------------
+    # edges-ml name -> (nimpy field name, quantity index / species selector)
+    _SCALAR_FIELD_MAP = {
+        'p':   ('p',  0),
+        'pe':  ('pe', 0),
+        'te':  ('te', 0),
+        'ti':  ('ti', 0),
+        't':   ('t',  0),
+        'ne':  ('n',  'electron'),
+        'ni':  ('n',  'ion'),
+        'n':   ('n',  'electron'),
+        'psi': ('psi', 0),
+    }
+
+    # edges-ml name -> nimpy vector field name
+    _VECTOR_FIELD_MAP = {
+        'b': 'b', 'B': 'b',
+        'v': 'v',
+        'j': 'j', 'J': 'j',
+        'e': 'e', 'E': 'e',
+    }
+
+    # Composite quantities built from other fields.
+    _DERIVED_FIELDS = {
+        'pi': ('p', 'pe'),   # ion pressure = total - electron
+    }
+
+    # Ordered list of nimpy 'fieldlist' strings to attempt when initialising
+    # EvalNimrod.  The first one that initialises successfully is kept.
+    _FIELDLIST_CANDIDATES = ('nvptbje', 'nvptbj', 'nvptb', 'nvpt', 'nvp', 'n')
+
+    # Flux-average names that require no FSA integrand (taken from dvar).
+    _FSA_FROM_DVAR = {
+        'psi_norm': 0,
+        'rho':      1,
+        'flux_p':   2,
+        'flux_t':   3,
+        'q':        7,
+    }
+
+    # NIMROD binary-file traces mapped onto the shared edges-ml registry.
+    #   key -> (file kind, variable name in nimpy's readBin registry)
+    _TIME_TRACE_MAP = {
+        'time':             ('discharge', 't'),
+        'E_P':              ('discharge', 'Total Int E'),
+        'E_PE':             ('discharge', 'Ele Int E'),
+        'toroidal_current': ('discharge', 'I total'),
+        'loop_voltage':     ('discharge', 'Volt'),
+        'toroidal_flux':    ('discharge', 'Total Flux'),
+    }
+    # Traces obtained by summing energy.bin over all toroidal modes.
+    _TIME_TRACE_ENERGY_SUM = {
+        'W_M': 'E magnetic',
+    }
 
     def __init__(self, model_dir):
         super().__init__(model_dir)
@@ -56,6 +176,60 @@ class NIMRODAdapter(SimulationAdapter):
         self._indexed_dumps_per_dir = {}
         self._common_max_index_cache = None
         self._mode_dirs = []
+
+        # Configuration captured from build_dataset (see extract_* overrides).
+        self._config = {}
+
+        # nimpy EvalNimrod handling (the shared library can only hold one file).
+        self._active_eval = None
+        self._active_eval_key = None
+        self._fieldlist = None
+
+        # Caches
+        self._eval_grid_cache = {}
+        self._fsa_cache = {}
+        self._fsa_failed = set()
+        self._axis_cache = {}
+        self._bin_cache = {}
+        self._native_points_cache = {}
+        self._wall_polygon = None
+        self._wall_polygon_searched = False
+        self._metadata_cache = None
+        self._global_params_cache = None
+        self._warned_fields = set()
+
+    # ======================================================================
+    # CONFIG CAPTURE (so the adapter can size/limit the expensive FSA calls)
+    # ======================================================================
+
+    def extract_grids(self, config):
+        self._config = config or {}
+        return super().extract_grids(config)
+
+    def extract_equilibrium(self, config):
+        self._config = config or {}
+        return super().extract_equilibrium(config)
+
+    def extract_total_fields(self, config):
+        self._config = config or {}
+        return super().extract_total_fields(config)
+
+    def extract_mode(self, mode_dir, config):
+        self._config = config or {}
+        return super().extract_mode(mode_dir, config)
+
+    def close(self):
+        """Release cached nimpy handles and derived data."""
+        self._active_eval = None
+        self._active_eval_key = None
+        self._eval_grid_cache.clear()
+        self._fsa_cache.clear()
+        self._axis_cache.clear()
+        self._bin_cache.clear()
+
+    # ======================================================================
+    # MODE DIRECTORY / DUMP DISCOVERY  (unchanged behaviour)
+    # ======================================================================
 
     def set_mode_dirs(self, mode_dirs):
         """
@@ -395,6 +569,13 @@ class NIMRODAdapter(SimulationAdapter):
 
         return None
 
+    def _last_dump_in_dir(self, mode_dir):
+        """Returns the path of the final (largest index) dump in a mode directory."""
+        indexed = self._get_indexed_dumps_for_dir(Path(mode_dir))
+        if not indexed:
+            return None
+        return str(indexed[-1][2])
+
     def _select_dump_files(self, mode_dir, selection="all"):
         """
         Selects which HDF5 dump files of a given nXX directory should be handed
@@ -442,6 +623,1284 @@ class NIMRODAdapter(SimulationAdapter):
 
         return [str(p) for _, _, p in indexed]
 
+    # ======================================================================
+    # EVALNIMROD HANDLING
+    # ======================================================================
+
+    def _get_eval(self, dump_file, fieldlist=None):
+        """
+        Returns a cached EvalNimrod instance for the given dump file.
+
+        The nimpy shared library can only keep one dump file open at a time, so
+        a single active handle is tracked and re-initialised on demand.
+        """
+        if not _NIMPY_EVAL_AVAILABLE or dump_file is None:
+            return None
+
+        dump_path = Path(dump_file).resolve()
+        requested = fieldlist or self._fieldlist
+
+        if requested is not None:
+            key = (str(dump_path), requested)
+            if self._active_eval_key == key and self._active_eval is not None:
+                return self._active_eval
+
+        if requested is not None:
+            candidates = [requested] + [f for f in self._FIELDLIST_CANDIDATES if f != requested]
+        else:
+            candidates = list(self._FIELDLIST_CANDIDATES)
+
+        errors = []
+        for fl in candidates:
+            try:
+                with _pushd(dump_path.parent):
+                    ev = EvalNimrod(str(dump_path), fieldlist=fl, path='./')
+                self._active_eval = ev
+                self._active_eval_key = (str(dump_path), fl)
+                self._fieldlist = fl
+                return ev
+            except Exception as exc:
+                errors.append(f"{fl}: {type(exc).__name__}: {exc}")
+
+        printerr(
+            f"Could not initialise EvalNimrod for {dump_path.name}. Attempts:\n  "
+            + "\n  ".join(errors)
+        )
+        self._active_eval = None
+        self._active_eval_key = None
+        return None
+
+    def _get_eval_grid(self, ev, dump_file, rzp, field):
+        """
+        Returns a cached EvalGrid for the given point set (logical mapping reuse).
+        Returns None if EvalGrid is unavailable or disabled.
+        """
+        if not _NIMPY_EVAL_AVAILABLE:
+            return None
+        if not self._config.get("nimrod_use_eval_grid", True):
+            return None
+
+        try:
+            sig = hashlib.md5(np.ascontiguousarray(rzp, dtype=float).tobytes()).hexdigest()
+        except Exception:
+            return None
+
+        key = (str(Path(dump_file).resolve().parent), sig)
+        grid = self._eval_grid_cache.get(key)
+        if grid is not None:
+            return grid
+
+        try:
+            grid = EvalGrid(np.asarray(rzp, dtype=float))
+            with _pushd(Path(dump_file).resolve().parent):
+                grid.set_logical_grid(field, ev)
+            self._eval_grid_cache[key] = grid
+            return grid
+        except Exception as exc:
+            printwarn(f"EvalGrid construction failed ({type(exc).__name__}: {exc}); using direct evaluation.")
+            return None
+
+    def _eval_raw(self, ev, dump_file, nim_field, R, Z, phi, eq=2):
+        """Evaluates a nimpy field at the supplied points; returns (nqty, N) array."""
+        rzp = np.array([np.asarray(R, dtype=float).ravel(),
+                        np.asarray(Z, dtype=float).ravel(),
+                        np.asarray(phi, dtype=float).ravel()])
+
+        grid = self._get_eval_grid(ev, dump_file, rzp, nim_field)
+
+        with _pushd(Path(dump_file).resolve().parent):
+            if grid is not None:
+                try:
+                    return ev.eval_field(nim_field, grid, dmode=0, eq=eq)
+                except Exception:
+                    pass
+            return ev.eval_field(nim_field, rzp, dmode=0, eq=eq)
+
+    def _warn_field_once(self, name, message):
+        if name not in self._warned_fields:
+            printwarn(message)
+            self._warned_fields.add(name)
+
+    def _ion_index(self, ev):
+        """Index of the first ion species inside the nimpy 'n' field."""
+        try:
+            return 1 if int(getattr(ev, 'ndnq', 1)) > 1 else 0
+        except Exception:
+            return 0
+
+    def _resolve_field(self, name):
+        """
+        Maps an edges-ml field name onto a NIMROD field specification.
+        Returns (kind, payload) with kind in {'scalar', 'vector', 'derived'} or
+        (None, None) if the field is not available for NIMROD.
+        """
+        raw = str(name)
+        low = raw.lower()
+
+        if low in self._DERIVED_FIELDS:
+            return 'derived', self._DERIVED_FIELDS[low]
+        if raw in self._VECTOR_FIELD_MAP:
+            return 'vector', self._VECTOR_FIELD_MAP[raw]
+        if low in self._VECTOR_FIELD_MAP:
+            return 'vector', self._VECTOR_FIELD_MAP[low]
+        if low in self._SCALAR_FIELD_MAP:
+            return 'scalar', self._SCALAR_FIELD_MAP[low]
+        return None, None
+
+    def _map_nimrod_field(self, name):
+        """Backwards-compatible helper: returns the bare nimpy field name."""
+        kind, payload = self._resolve_field(name)
+        if kind == 'scalar':
+            return payload[0]
+        if kind == 'vector':
+            return payload
+        return None
+
+    def _evaluate_field_at_points(self, name, R, Z, phi, dump_file, eq=2):
+        """
+        Evaluates an edges-ml field name at arbitrary (R, Z, phi) points.
+        Returns an ndarray for scalars, or a {component: ndarray} dict for vectors.
+        """
+        if dump_file is None:
+            return np.array([])
+
+        kind, payload = self._resolve_field(name)
+        if kind is None:
+            self._warn_field_once(
+                name, f"Field '{name}' is not available from NIMROD dumps; skipping."
+            )
+            return np.array([])
+
+        ev = self._get_eval(dump_file)
+        if ev is None:
+            return np.array([])
+
+        try:
+            if kind == 'derived':
+                total_name, sub_name = payload
+                total = self._evaluate_field_at_points(total_name, R, Z, phi, dump_file, eq)
+                sub   = self._evaluate_field_at_points(sub_name,   R, Z, phi, dump_file, eq)
+                if np.size(total) == 0 or np.size(sub) == 0:
+                    return np.array([])
+                return np.asarray(total) - np.asarray(sub)
+
+            if kind == 'scalar':
+                nim_field, idx = payload
+                res = self._eval_raw(ev, dump_file, nim_field, R, Z, phi, eq=eq)
+                res = np.atleast_2d(np.asarray(res))
+                if idx == 'electron':
+                    k = 0
+                elif idx == 'ion':
+                    k = self._ion_index(ev)
+                else:
+                    k = int(idx)
+                k = min(k, res.shape[0] - 1)
+                return res[k]
+
+            # vector
+            nim_field = payload
+            res = np.atleast_2d(np.asarray(self._eval_raw(ev, dump_file, nim_field, R, Z, phi, eq=eq)))
+            if res.shape[0] < 3:
+                self._warn_field_once(
+                    name, f"Field '{name}' did not return 3 components from NIMROD; skipping."
+                )
+                return np.array([])
+            return {
+                f"{name}_R":   res[0],
+                f"{name}_Z":   res[1],
+                f"{name}_phi": self.PHI_SIGN_FLIP * res[2],
+            }
+
+        except Exception as exc:
+            self._warn_field_once(
+                name, f"Error evaluating NIMROD field '{name}': {type(exc).__name__}: {exc}"
+            )
+            return np.array([])
+
+    # ======================================================================
+    # GEOMETRY / GRIDS
+    # ======================================================================
+
+    def _get_bounding_box(self, time=-1):
+        """
+        Reads the underlying NIMROD HDF5 dump file to dynamically find the
+        global minimum and maximum R and Z coordinates.
+        Returns: (rmin, rmax, zmin, zmax)
+        """
+        pts = self._get_native_mesh_points(time)
+        if len(pts) > 0:
+            return (float(np.min(pts[:, 0])), float(np.max(pts[:, 0])),
+                    float(np.min(pts[:, 1])), float(np.max(pts[:, 1])))
+        return 1.0, 2.0, -1.0, 1.0
+
+    def _get_native_mesh_points(self, time=-1):
+        """Returns the (R, Z) coordinates of the native NIMROD finite element nodes."""
+        dump_file = self._get_dump_file(time)
+        if not dump_file:
+            return np.empty((0, 2))
+
+        if dump_file in self._native_points_cache:
+            return self._native_points_cache[dump_file]
+
+        chunks = []
+        try:
+            with h5py.File(dump_file, 'r') as h5:
+                rblocks = h5.get('rblocks')
+                if rblocks:
+                    for block_name in rblocks.keys():
+                        rz_name = f"rz{block_name}"
+                        if rz_name in rblocks[block_name]:
+                            rzdat = np.asarray(rblocks[block_name][rz_name][()])
+                            chunks.append(rzdat.reshape(-1, rzdat.shape[-1])[:, :2])
+        except Exception as exc:
+            printwarn(f"Failed to read native mesh from {dump_file}: {exc}")
+
+        if chunks:
+            pts = np.concatenate(chunks, axis=0)
+            pts = np.unique(np.round(pts, 12), axis=0)
+        else:
+            pts = np.empty((0, 2))
+
+        self._native_points_cache[dump_file] = pts
+        return pts
+
+    def _get_wall_polygon(self):
+        """
+        Returns the (R, Z) wall polygon from contours.h5 or sol.grn, or None.
+        """
+        if self._wall_polygon_searched:
+            return self._wall_polygon
+        self._wall_polygon_searched = True
+
+        search_dirs = list(self._mode_dirs) + [self.model_dir, self.model_dir.parent]
+        for d in search_dirs:
+            cfile = Path(d) / "contours.h5"
+            if cfile.is_file():
+                try:
+                    with h5py.File(cfile, 'r') as h5:
+                        if '/wall/points' in h5:
+                            pts = np.asarray(h5['/wall/points'][()])
+                            self._wall_polygon = np.vstack([pts, pts[0, :]])
+                            return self._wall_polygon
+                except Exception:
+                    pass
+
+            sfile = Path(d) / "sol.grn"
+            if sfile.is_file():
+                try:
+                    with open(sfile, 'r') as f:
+                        lines = f.readlines()
+                    nsep = int(lines[8].split()[1])
+                    rz = np.zeros((nsep, 2))
+                    for idx in range(nsep):
+                        rz[idx, 0] = float(lines[9].split()[idx])
+                        rz[idx, 1] = float(lines[11].split()[idx])
+                    self._wall_polygon = np.vstack([rz, rz[0, :]])
+                    return self._wall_polygon
+                except Exception:
+                    pass
+
+        return self._wall_polygon
+
+    def _get_inside_wall_points(self, time=-1):
+        """
+        Native mesh nodes restricted to the interior of the wall contour (when one
+        is available).  Falls back to the full native mesh.
+        """
+        if getattr(self, 'shared_inner_wall_points', None) is not None:
+            return np.asarray(self.shared_inner_wall_points)
+
+        pts = self._get_native_mesh_points(time)
+        if len(pts) == 0:
+            return pts
+
+        poly = self._get_wall_polygon()
+        if poly is None:
+            return pts
+
+        try:
+            from matplotlib.path import Path as MplPath
+            mask = MplPath(np.asarray(poly)[:, :2]).contains_points(pts)
+            inside = pts[mask]
+            if len(inside) > 0:
+                return inside
+        except Exception as exc:
+            printwarn(f"Could not filter points by the NIMROD wall contour: {exc}")
+
+        return pts
+
+    def _grid_points_2d(self, grid_spec, time=-1):
+        """Returns (R, Z) 1D arrays for the requested 2D grid specification."""
+        if grid_spec.type == "rectangular":
+            rmin, rmax, zmin, zmax = self._get_bounding_box(time)
+            nR, nZ = grid_spec.resolution
+            R_lin = np.linspace(rmin, rmax, nR)
+            Z_lin = np.linspace(zmin, zmax, nZ)
+            R, Z = np.meshgrid(R_lin, Z_lin, indexing='ij')
+            return R.ravel(), Z.ravel()
+
+        if grid_spec.type == "native":
+            pts = self._get_native_mesh_points(time)
+            if len(pts) == 0:
+                return np.array([]), np.array([])
+            return pts[:, 0], pts[:, 1]
+
+        if grid_spec.type == "inside_wall":
+            pts = self._get_inside_wall_points(time)
+            if len(pts) == 0:
+                return np.array([]), np.array([])
+            return pts[:, 0], pts[:, 1]
+
+        printwarn(f"Grid type '{grid_spec.type}' is not supported for NIMROD.")
+        return np.array([]), np.array([])
+
+    def _grid_points_3d(self, grid_spec, time=-1):
+        """Returns (R, phi, Z) 1D arrays for the requested 3D grid specification."""
+        if grid_spec.type == "rectangular":
+            rmin, rmax, zmin, zmax = self._get_bounding_box(time)
+            nR, nPhi, nZ = grid_spec.resolution
+            R_lin   = np.linspace(rmin, rmax, nR)
+            Phi_lin = np.linspace(0, 2 * np.pi, nPhi, endpoint=False)
+            Z_lin   = np.linspace(zmin, zmax, nZ)
+            R, Phi, Z = np.meshgrid(R_lin, Phi_lin, Z_lin, indexing='ij')
+            return R.ravel(), Phi.ravel(), Z.ravel()
+
+        if grid_spec.type in ("native", "inside_wall"):
+            R, Z = self._grid_points_2d(grid_spec, time)
+            return R, np.zeros_like(R), Z
+
+        printwarn(f"Grid type '{grid_spec.type}' is not supported for NIMROD.")
+        return np.array([]), np.array([]), np.array([])
+
+    def get_2d_mesh(self, grid_spec):
+        R, Z = self._grid_points_2d(grid_spec, time=-1)
+        if R.size == 0:
+            return np.array([])
+        return np.column_stack((R, Z))
+
+    def get_3d_mesh(self, grid_spec):
+        R, phi, Z = self._grid_points_3d(grid_spec, time=-1)
+        if R.size == 0:
+            return np.array([])
+        return np.column_stack((R, phi, Z))
+
+    def get_2d_field(self, name, grid_spec, units, time=-1):
+        dump_file = self._get_dump_file(time)
+        if not dump_file:
+            return np.array([])
+        R, Z = self._grid_points_2d(grid_spec, time)
+        if R.size == 0:
+            return np.array([])
+        phi = np.zeros_like(R)
+        return self._evaluate_field_at_points(name, R, Z, phi, dump_file, eq=2)
+
+    def get_3d_field(self, name, grid_spec, units, time=-1):
+        dump_file = self._get_dump_file(time)
+        if not dump_file:
+            return np.array([])
+        R, phi, Z = self._grid_points_3d(grid_spec, time)
+        if R.size == 0:
+            return np.array([])
+        return self._evaluate_field_at_points(name, R, Z, phi, dump_file, eq=2)
+
+    def get_mode_2d_mesh(self, mode_dir, grid_spec):
+        return self.get_2d_mesh(grid_spec)
+
+    def get_mode_3d_mesh(self, mode_dir, grid_spec):
+        return self.get_3d_mesh(grid_spec)
+
+    def get_mode_2d_field(self, mode_dir, name, grid_spec, units):
+        """Evaluates the field at the final dump of the given mode directory."""
+        dump_file = self._last_dump_in_dir(mode_dir)
+        if dump_file is None:
+            printwarn(f"No dump files found in mode directory {mode_dir}.")
+            return np.array([])
+        R, Z = self._grid_points_2d(grid_spec, time=-1)
+        if R.size == 0:
+            return np.array([])
+        phi = np.zeros_like(R)
+        return self._evaluate_field_at_points(name, R, Z, phi, dump_file, eq=2)
+
+    def get_mode_3d_field(self, mode_dir, name, grid_spec, units):
+        """Evaluates the field at the final dump of the given mode directory."""
+        dump_file = self._last_dump_in_dir(mode_dir)
+        if dump_file is None:
+            printwarn(f"No dump files found in mode directory {mode_dir}.")
+            return np.array([])
+        R, phi, Z = self._grid_points_3d(grid_spec, time=-1)
+        if R.size == 0:
+            return np.array([])
+        return self._evaluate_field_at_points(name, R, Z, phi, dump_file, eq=2)
+
+    # ======================================================================
+    # FLUX SURFACE AVERAGES (nimpy.fsa)
+    # ======================================================================
+
+    # Integrand evaluators: key -> callable(ev, rzc, eq, ion_index) -> float
+    @staticmethod
+    def _fsa_evaluators():
+        def scalar(field, idx=0):
+            def _f(ev, rzc, eq, ion):
+                v = ev.eval_field(field, rzc, dmode=0, eq=eq)
+                k = ion if idx == 'ion' else int(idx)
+                return float(np.atleast_1d(v)[min(k, np.size(v) - 1)])
+            return _f
+
+        def vec_comp(field, comp):
+            def _f(ev, rzc, eq, ion):
+                v = ev.eval_field(field, rzc, dmode=0, eq=eq)
+                return float(v[comp])
+            return _f
+
+        def vec_mag(field):
+            def _f(ev, rzc, eq, ion):
+                v = ev.eval_field(field, rzc, dmode=0, eq=eq)
+                return float(np.sqrt(v[0] ** 2 + v[1] ** 2 + v[2] ** 2))
+            return _f
+
+        def bpol(power):
+            def _f(ev, rzc, eq, ion):
+                b = ev.eval_field('b', rzc, dmode=0, eq=eq)
+                bp2 = b[0] ** 2 + b[1] ** 2
+                return float(bp2 if power == 2 else np.sqrt(bp2))
+            return _f
+
+        def rbphi(ev, rzc, eq, ion):
+            b = ev.eval_field('b', rzc, dmode=0, eq=eq)
+            return float(rzc[0] * b[2])
+
+        def jphi_over_r(ev, rzc, eq, ion):
+            j = ev.eval_field('j', rzc, dmode=0, eq=eq)
+            return float(j[2] / rzc[0])
+
+        return {
+            'p':    scalar('p'),
+            'pe':   scalar('pe'),
+            'te':   scalar('te'),
+            'ti':   scalar('ti'),
+            'psi':  scalar('psi'),
+            'ne':   scalar('n', 0),
+            'ni':   scalar('n', 'ion'),
+            'B':    vec_mag('b'),
+            'v':    vec_mag('v'),
+            'j':    vec_mag('j'),
+            'B_R':   vec_comp('b', 0),
+            'B_Z':   vec_comp('b', 1),
+            'B_phi': vec_comp('b', 2),
+            'v_R':   vec_comp('v', 0),
+            'v_Z':   vec_comp('v', 1),
+            'v_phi': vec_comp('v', 2),
+            'j_R':   vec_comp('j', 0),
+            'j_Z':   vec_comp('j', 1),
+            'j_phi': vec_comp('j', 2),
+            'Bp':    bpol(1),
+            'Bp2':   bpol(2),
+            'f':     rbphi,
+            'jphi_over_R': jphi_over_r,
+        }
+
+    # edges-ml flux average name -> integrand keys that must be computed
+    _FSA_NAME_TO_KEYS = {
+        'p':    ('p',),
+        'pe':   ('pe',),
+        'pi':   ('p', 'pe'),
+        'ne':   ('ne',),
+        'ni':   ('ni',),
+        'te':   ('te',),
+        'ti':   ('ti',),
+        'psi':  ('psi',),
+        'B':    ('B_R', 'B_Z', 'B_phi'),
+        'v':    ('v_R', 'v_Z', 'v_phi'),
+        'j':    ('j_R', 'j_Z', 'j_phi'),
+        'f':    ('f',),
+        'ffprime': ('f',),
+        'Ip':   ('jphi_over_R',),
+        'V':    (),
+        'q':    (),
+        'rho':  (),
+        'flux_p': (),
+        'flux_t': (),
+    }
+
+    _GLOBAL_FSA_KEYS = ('p', 'Bp', 'Bp2', 'jphi_over_R', 'f')
+
+    def _requested_fsa_keys(self):
+        """Integrand keys required by the current configuration."""
+        cfg = self._config or {}
+        names = set()
+        for opt in ("flux_averages", "total_flux_averages"):
+            sel = cfg.get(opt, None)
+            names.update(expand_request(sel, AVAILABLE_FLUX_AVERAGES) or [])
+        if not names:
+            names = set(AVAILABLE_FLUX_AVERAGES)
+
+        keys = set()
+        for n in names:
+            keys.update(self._FSA_NAME_TO_KEYS.get(n, ()))
+
+        if cfg.get("nimrod_compute_globals", True):
+            keys.update(self._GLOBAL_FSA_KEYS)
+
+        # q_profile in the mode section also needs FSA (dvar only).
+        return tuple(sorted(keys))
+
+    def _fsa_nsurf(self, resolution):
+        cfg = self._config or {}
+        return int(cfg.get("nimrod_fsa_nsurf", min(int(resolution), 60)))
+
+    def _find_magnetic_axis(self, ev, dump_file, time=-1):
+        """Coarse search for |Bpol| minimum, refined with nimpy's find_pf_null."""
+        key = str(Path(dump_file).resolve())
+        if key in self._axis_cache:
+            return self._axis_cache[key]
+
+        rmin, rmax, zmin, zmax = self._get_bounding_box(time)
+        dr = 0.08 * (rmax - rmin)
+        dz = 0.08 * (zmax - zmin)
+        R_lin = np.linspace(rmin + dr, rmax - dr, 25)
+        Z_lin = np.linspace(zmin + dz, zmax - dz, 25)
+        Rg, Zg = np.meshgrid(R_lin, Z_lin, indexing='ij')
+        phi = np.zeros_like(Rg)
+
+        axis = np.array([0.5 * (rmin + rmax), 0.5 * (zmin + zmax), 0.0])
+        try:
+            res = self._eval_raw(ev, dump_file, 'b', Rg.ravel(), Zg.ravel(), phi.ravel(), eq=1)
+            bp = np.sqrt(np.asarray(res[0]) ** 2 + np.asarray(res[1]) ** 2)
+            if np.any(np.isfinite(bp)):
+                i = int(np.nanargmin(bp))
+                axis = np.array([Rg.ravel()[i], Zg.ravel()[i], 0.0])
+        except Exception as exc:
+            printwarn(f"Coarse magnetic-axis search failed: {exc}")
+
+        if _NIMPY_FSA_AVAILABLE:
+            try:
+                with _pushd(Path(dump_file).resolve().parent):
+                    axis = np.asarray(find_pf_null(ev, axis, addpert=False))
+            except Exception as exc:
+                printwarn(f"find_pf_null could not refine the magnetic axis: {exc}")
+
+        self._axis_cache[key] = axis
+        return axis
+
+    def _get_fsa_record(self, dump_file, nsurf, eq=1):
+        """
+        Runs (and caches) a single FSA pass for the given dump, computing every
+        integrand key required by the configuration.
+
+        Returns a dict with 'dvar', 'contours', 'axis' and 'values' (key -> array),
+        or None if the FSA could not be performed.
+        """
+        if dump_file is None or not (_NIMPY_FSA_AVAILABLE and _NIMPY_EVAL_AVAILABLE):
+            return None
+        if not (self._config or {}).get("nimrod_enable_fsa", True):
+            return None
+
+        keys = self._requested_fsa_keys()
+        cache_key = (str(Path(dump_file).resolve()), int(nsurf), int(eq), keys)
+        if cache_key in self._fsa_cache:
+            return self._fsa_cache[cache_key]
+        if cache_key in self._fsa_failed:
+            return None
+
+        ev = self._get_eval(dump_file)
+        if ev is None:
+            self._fsa_failed.add(cache_key)
+            return None
+
+        axis = self._find_magnetic_axis(ev, dump_file)
+        ion = self._ion_index(ev)
+        evaluators = self._fsa_evaluators()
+        funcs = [evaluators[k] for k in keys]
+        neq = max(1, len(funcs))
+
+        def integrand(rzc, y, dy, eval_nimrod, fdict):
+            for i, fn in enumerate(funcs):
+                try:
+                    dy[4 + i] = fn(eval_nimrod, rzc, eq, ion) * dy[2]
+                except Exception:
+                    dy[4 + i] = np.nan
+            return dy
+
+        printnote(f"NIMROD: running flux surface average on {Path(dump_file).name} "
+                  f"({nsurf} surfaces, {len(keys)} quantities).")
+
+        try:
+            # FSAInput.d is a class-level global in nimpy; reset it so that a
+            # previous model's axis/x-point are not reused for this one.
+            FSAInput.d['rzo'] = [float(axis[0]), float(axis[1]), 0.0]
+            FSAInput.d['rzx'] = None
+            FSAInput.d['rzs'] = None
+            FSAInput.d['psis'] = None
+            FSAInput.d['phis'] = None
+
+            with _pushd(Path(dump_file).resolve().parent):
+                dvar, yvals, contours = FSA(
+                    ev, list(axis), integrand, neq,
+                    nsurf=int(nsurf),
+                    depvar='eta',
+                    plot_contours=False,
+                    normalize=True,
+                    addpert=(eq != 1),
+                )
+        except Exception as exc:
+            printerr(f"FSA failed for {Path(dump_file).name}: {type(exc).__name__}: {exc}")
+            self._fsa_failed.add(cache_key)
+            return None
+        finally:
+            FSAInput.d['rzo'] = None
+            FSAInput.d['rzx'] = None
+
+        dvar = np.asarray(dvar)
+        yvals = np.asarray(yvals)
+        if dvar.size == 0:
+            self._fsa_failed.add(cache_key)
+            return None
+
+        order = np.argsort(dvar[0, :])
+        dvar = dvar[:, order]
+        yvals = yvals[:, order] if yvals.size else yvals
+
+        values = {}
+        for i, k in enumerate(keys):
+            if i < yvals.shape[0]:
+                values[k] = np.asarray(yvals[i, :], dtype=float)
+
+        record = {
+            'dvar':     dvar,
+            'values':   values,
+            'contours': np.asarray(contours),
+            'axis':     axis,
+        }
+        self._fsa_cache[cache_key] = record
+        return record
+
+    def _fsa_grid(self, record, resolution, fcoords='pest'):
+        """Returns the 1D radial coordinate grid used for all NIMROD 1D output."""
+        dvar = record['dvar']
+        row = 1 if 'rho' in str(fcoords).lower() else 0
+        src = np.asarray(dvar[row, :], dtype=float)
+        good = np.isfinite(src)
+        if np.count_nonzero(good) < 2:
+            return np.array([]), np.array([])
+        src = src[good]
+        return np.linspace(float(src[0]), float(src[-1]), int(resolution)), src
+
+    def _interp_to_grid(self, record, values, resolution, fcoords='pest'):
+        grid, src = self._fsa_grid(record, resolution, fcoords)
+        if grid.size == 0:
+            return np.array([])
+        vals = np.asarray(values, dtype=float)
+        n = min(vals.size, src.size)
+        if n < 2:
+            return np.array([])
+        return np.interp(grid, src[:n], vals[:n])
+
+    def get_1d_mesh(self, resolution, units, fcoords):
+        record = self._get_fsa_record(self._get_dump_file(-1), self._fsa_nsurf(resolution), eq=1)
+        if record is None:
+            return np.array([])
+        grid, _ = self._fsa_grid(record, resolution, fcoords)
+        return grid
+
+    def get_flux_average(self, name, resolution, units, fcoords, time=-1, use_eq_fs=True):
+        """
+        Flux surface average of the requested quantity, computed with nimpy.fsa.
+
+        NIMROD data are already in SI units (temperatures in eV); the `units`
+        argument therefore only affects the labelling performed by the writer.
+        `use_eq_fs` is ignored: NIMROD surfaces always follow the axisymmetric
+        (n = 0) field of the requested dump.
+        """
+        dump_file = self._get_dump_file(time)
+        if dump_file is None:
+            return np.array([]), np.array([])
+
+        eq = 1 if time == -1 else 3
+        record = self._get_fsa_record(dump_file, self._fsa_nsurf(resolution), eq=eq)
+        if record is None:
+            return np.array([]), np.array([])
+
+        grid, src = self._fsa_grid(record, resolution, fcoords)
+        if grid.size == 0:
+            return np.array([]), np.array([])
+
+        dvar = record['dvar']
+        vals = record['values']
+
+        def interp(arr):
+            return self._interp_to_grid(record, arr, resolution, fcoords)
+
+        low = str(name).lower()
+
+        # --- quantities that come straight out of dvar -----------------
+        if low == 'q':
+            return grid, interp(dvar[7, :])
+        if low == 'rho':
+            return grid, interp(dvar[1, :])
+        if low == 'flux_p':
+            return grid, interp(2.0 * np.pi * dvar[2, :])
+        if low == 'flux_t':
+            return grid, interp(dvar[3, :])
+
+        # --- radially integrated quantities ----------------------------
+        if low == 'v':
+            # Careful: 'v' is the velocity field, 'V' is the volume.
+            if name == 'V':
+                vol = 2.0 * np.pi * _trapz_profile(dvar[6, :], dvar[2, :])
+                return grid, interp(vol)
+        if name == 'V':
+            vol = 2.0 * np.pi * _trapz_profile(dvar[6, :], dvar[2, :])
+            return grid, interp(vol)
+
+        if name == 'Ip' or low == 'ip':
+            if 'jphi_over_R' not in vals:
+                return grid, np.array([])
+            raw = np.asarray(vals['jphi_over_R']) * np.asarray(dvar[6, :])
+            cur = self.PHI_SIGN_FLIP * _trapz_profile(raw, dvar[2, :])
+            return grid, interp(cur)
+
+        if low == 'f':
+            if 'f' not in vals:
+                return grid, np.array([])
+            return grid, self.PHI_SIGN_FLIP * interp(vals['f'])
+
+        if low == 'ffprime':
+            if 'f' not in vals:
+                return grid, np.array([])
+            f = self.PHI_SIGN_FLIP * np.asarray(vals['f'], dtype=float)
+            psi = np.asarray(dvar[2, :], dtype=float)
+            n = min(f.size, psi.size)
+            if n < 3:
+                return grid, np.array([])
+            dfdpsi = np.gradient(f[:n], psi[:n])
+            return grid, interp(f[:n] * dfdpsi)
+
+        # --- vector quantities -----------------------------------------
+        if name in ('B', 'v', 'j'):
+            comps = {}
+            for suffix in ('R', 'Z', 'phi'):
+                key = f"{name}_{suffix}"
+                if key not in vals:
+                    continue
+                arr = interp(vals[key])
+                if suffix == 'phi':
+                    arr = self.PHI_SIGN_FLIP * arr
+                comps[f"{name}_{suffix}"] = arr
+            if not comps:
+                return grid, np.array([])
+            return grid, comps
+
+        # --- derived scalars -------------------------------------------
+        if low == 'pi':
+            if 'p' in vals and 'pe' in vals:
+                return grid, interp(np.asarray(vals['p']) - np.asarray(vals['pe']))
+            return grid, np.array([])
+
+        # --- plain scalars ----------------------------------------------
+        if low in vals:
+            return grid, interp(vals[low])
+        if name in vals:
+            return grid, interp(vals[name])
+
+        self._warn_field_once(
+            f"fsa::{name}",
+            f"Flux average '{name}' is not available for NIMROD; skipping."
+        )
+        return grid, np.array([])
+
+    def get_mode_1d_profile(self, mode_dir, name, resolution, units):
+        """1D radial profiles for a mode directory (currently the q profile)."""
+        if str(name).lower() not in ('q_profile', 'q'):
+            self._warn_field_once(
+                f"mode1d::{name}",
+                f"1D profile '{name}' is not available for NIMROD; skipping."
+            )
+            return np.array([])
+
+        dump_file = self._last_dump_in_dir(mode_dir)
+        if dump_file is None:
+            return np.array([])
+
+        record = self._get_fsa_record(dump_file, self._fsa_nsurf(resolution), eq=3)
+        if record is None:
+            return np.array([])
+
+        fcoords = (self._config or {}).get("fcoords", "pest")
+        return self._interp_to_grid(record, record['dvar'][7, :], resolution, fcoords)
+
+    # ======================================================================
+    # GLOBAL PARAMETERS (mirrors nimpy.globaleq without its yaml side effects)
+    # ======================================================================
+
+    def get_global_parameters(self):
+        if self._global_params_cache is not None:
+            return self._global_params_cache
+
+        out = {}
+        cfg = self._config or {}
+        if not cfg.get("nimrod_compute_globals", True):
+            self._global_params_cache = out
+            return out
+
+        dump_file = self._get_dump_file(-1)
+        resolution = int(cfg.get("resolutions", {}).get("1d", 200))
+        record = self._get_fsa_record(dump_file, self._fsa_nsurf(resolution), eq=1)
+        if record is None:
+            self._global_params_cache = out
+            return out
+
+        try:
+            dvar = record['dvar']
+            vals = record['values']
+            contours = record['contours']
+            axis = np.asarray(record['axis'], dtype=float)
+
+            psi = np.asarray(dvar[2, :], dtype=float)
+            vprime = np.asarray(dvar[6, :], dtype=float)
+            q = np.asarray(dvar[7, :], dtype=float)
+            psin = np.asarray(dvar[0, :], dtype=float)
+
+            out['R_axis'] = _finite(axis[0])
+            out['Z_axis'] = _finite(axis[1])
+
+            # --- LCFS shaping ------------------------------------------
+            if contours.size:
+                lcfs = np.asarray(contours[:, :, -1], dtype=float)
+                r_l = lcfs[0, :]
+                z_l = lcfs[1, :]
+                good = np.isfinite(r_l) & np.isfinite(z_l)
+                r_l = r_l[good]
+                z_l = z_l[good]
+                if r_l.size > 3:
+                    rmax_l, rmin_l = float(np.max(r_l)), float(np.min(r_l))
+                    ztop, zbot = float(np.max(z_l)), float(np.min(z_l))
+                    rgeo = 0.5 * (rmax_l + rmin_l)
+                    a = 0.5 * (rmax_l - rmin_l)
+                    out['R_geo'] = rgeo
+                    out['a_minor'] = a
+                    out['aspect_ratio'] = rgeo / a if a > 0 else np.nan
+                    out['kappa'] = (ztop - zbot) / (2.0 * a) if a > 0 else np.nan
+                    r_top = float(r_l[int(np.argmax(z_l))])
+                    r_bot = float(r_l[int(np.argmin(z_l))])
+                    out['delta_upper'] = (rgeo - r_top) / a if a > 0 else np.nan
+                    out['delta_lower'] = (rgeo - r_bot) / a if a > 0 else np.nan
+                    out['delta'] = 0.5 * (out['delta_upper'] + out['delta_lower'])
+
+            a_minor = out.get('a_minor', np.nan)
+
+            # --- safety factor ------------------------------------------
+            if q.size:
+                out['q0'] = _finite(q[0])
+                out['qa'] = _finite(q[-1])
+                out['q_min'] = _finite(np.nanmin(q))
+                out['q_max'] = _finite(np.nanmax(q))
+                if psin.size == q.size and psin.size > 1:
+                    out['q95'] = _finite(np.interp(0.95, psin, q))
+
+            # --- fluxes ---------------------------------------------------
+            if psi.size:
+                out['psi_axis'] = _finite(2.0 * np.pi * psi[0])
+                out['psi_lcfs'] = _finite(2.0 * np.pi * psi[-1])
+                out['poloidal_flux'] = _finite(2.0 * np.pi * (psi[-1] - psi[0]))
+            if dvar.shape[0] > 3:
+                out['toroidal_flux'] = _finite(dvar[3, -1])
+
+            # --- volume ---------------------------------------------------
+            vol_prof = 2.0 * np.pi * _trapz_profile(vprime, psi)
+            volume = float(vol_prof[-1]) if vol_prof.size else np.nan
+            out['volume'] = _finite(volume)
+
+            # --- plasma current -------------------------------------------
+            ip = np.nan
+            if 'jphi_over_R' in vals:
+                raw = np.asarray(vals['jphi_over_R']) * vprime
+                ip_prof = self.PHI_SIGN_FLIP * _trapz_profile(raw, psi)
+                ip = float(ip_prof[-1]) if ip_prof.size else np.nan
+            out['Ip'] = _finite(ip)
+
+            # --- on-axis values -------------------------------------------
+            ev = self._get_eval(dump_file)
+            if ev is not None:
+                rzo = np.array([axis[0], axis[1], 0.0])
+                with _pushd(Path(dump_file).resolve().parent):
+                    def _axis_scalar(field, idx=0):
+                        try:
+                            v = ev.eval_field(field, rzo, dmode=0, eq=1)
+                            return float(np.atleast_1d(v)[idx])
+                        except Exception:
+                            return np.nan
+
+                    b0 = np.nan
+                    try:
+                        bvec = ev.eval_field('b', rzo, dmode=0, eq=1)
+                        b0 = float(bvec[2])
+                    except Exception:
+                        pass
+
+                    out['B0'] = _finite(self.PHI_SIGN_FLIP * b0)
+                    out['p0'] = _finite(_axis_scalar('p'))
+                    out['ne0'] = _finite(_axis_scalar('n', 0))
+                    out['ni0'] = _finite(_axis_scalar('n', self._ion_index(ev)))
+                    out['Te0'] = _finite(_axis_scalar('te'))
+                    out['Ti0'] = _finite(_axis_scalar('ti'))
+
+            b0_abs = abs(_finite(out.get('B0', np.nan), 0.0))
+
+            # --- averaged pressure / betas --------------------------------
+            if 'p' in vals and vprime.size:
+                p_raw = np.asarray(vals['p']) * vprime
+                p_int = _trapz_profile(p_raw, psi)
+                v_int = _trapz_profile(vprime, psi)
+                if v_int.size and v_int[-1] != 0:
+                    pave = float(p_int[-1] / v_int[-1])
+                    out['p_average'] = _finite(pave)
+                    if b0_abs > 0:
+                        betat = 2.0 * self.MU0 * pave / (b0_abs ** 2)
+                        out['beta_t'] = _finite(betat)
+                        if np.isfinite(a_minor) and np.isfinite(ip) and ip != 0:
+                            out['beta_n'] = _finite(1.0e8 * a_minor * b0_abs * betat / abs(ip))
+
+                    # poloidal beta / internal inductance
+                    if 'Bp' in vals and 'Bp2' in vals:
+                        bp_a = float(np.asarray(vals['Bp'])[-1])
+                        bp2_a = float(np.asarray(vals['Bp2'])[-1])
+                        if bp_a != 0:
+                            bp0 = bp2_a / bp_a
+                            if bp0 != 0:
+                                out['beta_p'] = _finite(2.0 * self.MU0 * pave / (bp0 ** 2))
+                                bp2_raw = np.asarray(vals['Bp2']) * vprime
+                                bp2_int = _trapz_profile(bp2_raw, psi)
+                                if v_int[-1] != 0:
+                                    out['li'] = _finite((bp2_int[-1] / v_int[-1]) / (bp0 ** 2))
+
+        except Exception as exc:
+            printwarn(f"Could not compute NIMROD global parameters: {type(exc).__name__}: {exc}")
+
+        self._global_params_cache = out
+        return out
+
+    # ======================================================================
+    # TIME TRACES (nimpy.read_bin)
+    # ======================================================================
+
+    def _find_bin_file(self, candidates):
+        dirs = list(self._mode_dirs) + [self.model_dir]
+        for d in dirs:
+            for nm in candidates:
+                p = Path(d) / nm
+                if p.is_file():
+                    return p
+        return None
+
+    def _read_nimrod_bin(self, filepath):
+        """
+        Reads a NIMROD binary/text diagnostic file with nimpy's readBin.
+        Returns (var_names, data[nvar, nrps, nsteps]) or (None, None).
+        """
+        if not _NIMPY_READBIN_AVAILABLE or filepath is None:
+            return None, None
+
+        key = str(Path(filepath).resolve())
+        if key in self._bin_cache:
+            return self._bin_cache[key]
+
+        try:
+            with _pushd(Path(filepath).parent):
+                rb = readBin()
+                ftype = rb.get_file_type(Path(filepath).name)
+                var_names, depvar, plot_list, mode_file = rb.data_dict[ftype]
+                nvar = len(var_names)
+                nrps = rb.nimrodin['nmodes'] if mode_file else 1
+                data = rb.read_file(Path(filepath).name, True, nrps, nvar)
+            result = (list(var_names), np.asarray(data))
+        except Exception as exc:
+            printwarn(f"Could not read NIMROD diagnostic file {filepath}: {type(exc).__name__}: {exc}")
+            result = (None, None)
+
+        self._bin_cache[key] = result
+        return result
+
+    def get_time_trace(self, name, units):
+        """
+        Extracts a scalar time trace from NIMROD's discharge.bin / energy.bin.
+
+        Only quantities with an unambiguous counterpart in the shared registry
+        are mapped; everything else returns empty arrays and is skipped by the
+        writer.
+        """
+        if not _NIMPY_READBIN_AVAILABLE:
+            return np.array([]), np.array([])
+
+        discharge = self._find_bin_file(("discharge.bin", "discharge.txt"))
+        energy    = self._find_bin_file(("energy.bin", "energy.txt", "logen.bin"))
+
+        # --- discharge.bin based traces --------------------------------
+        if name in self._TIME_TRACE_MAP:
+            kind, var = self._TIME_TRACE_MAP[name]
+            if kind == 'discharge' and discharge is not None:
+                var_names, data = self._read_nimrod_bin(discharge)
+                if var_names and var in var_names:
+                    t = np.asarray(data[var_names.index('t'), 0, :], dtype=float)
+                    v = np.asarray(data[var_names.index(var), 0, :], dtype=float)
+                    return t, v
+
+        # --- energy.bin (summed over toroidal modes) ---------------------
+        if name in self._TIME_TRACE_ENERGY_SUM and energy is not None:
+            var = self._TIME_TRACE_ENERGY_SUM[name]
+            var_names, data = self._read_nimrod_bin(energy)
+            if var_names and var in var_names:
+                t = np.asarray(data[var_names.index('t'), 0, :], dtype=float)
+                v = np.asarray(data[var_names.index(var), :, :], dtype=float).sum(axis=0)
+                return t, v
+
+        # --- fall back for the bare time axis ----------------------------
+        if name == 'time' and energy is not None:
+            var_names, data = self._read_nimrod_bin(energy)
+            if var_names and 't' in var_names:
+                t = np.asarray(data[var_names.index('t'), 0, :], dtype=float)
+                return t, t
+
+        self._warn_field_once(
+            f"trace::{name}",
+            f"Time trace '{name}' has no NIMROD counterpart; skipping."
+        )
+        return np.array([]), np.array([])
+
+    # ======================================================================
+    # METADATA / INPUTS / REPRODUCIBILITY
+    # ======================================================================
+
+    def _parse_nimrod_version(self, mode_dirs):
+        """Best-effort extraction of the NIMROD release version and build date."""
+        release_version = "Unknown"
+        build_date = "Unknown"
+
+        # 1) HDF5 dump attributes
+        dump_file = self._get_dump_file(-1)
+        if dump_file:
+            try:
+                with h5py.File(dump_file, 'r') as h5:
+                    for key, val in h5.attrs.items():
+                        k = str(key).lower()
+                        try:
+                            sval = val.decode() if isinstance(val, bytes) else str(np.ravel(val)[0])
+                        except Exception:
+                            sval = str(val)
+                        if 'version' in k and release_version == "Unknown":
+                            release_version = sval.strip()
+                        if ('date' in k or 'build' in k) and build_date == "Unknown":
+                            build_date = sval.strip()
+            except Exception:
+                pass
+
+        # 2) stdout / log files
+        candidates = []
+        for d in list(mode_dirs or []) + [self.model_dir]:
+            d = Path(d)
+            for pattern in ("slurm*.out", "*.out", "nimrod.log", "*.log"):
+                candidates.extend(sorted(d.glob(pattern)))
+        candidates = list(dict.fromkeys(candidates))
+        candidates.sort(key=lambda f: f.stat().st_mtime if f.exists() else 0, reverse=True)
+
+        rx_ver = re.compile(r'(?:NIMROD|RELEASE|CODE)\s*(?:VERSION|RELEASE)?\s*[:=]\s*(\S.*)', re.IGNORECASE)
+        rx_bld = re.compile(r'BUILD\s*DATE\s*[:=]\s*(\S.*)', re.IGNORECASE)
+
+        for f in candidates[:20]:
+            if release_version != "Unknown" and build_date != "Unknown":
+                break
+            try:
+                with open(f, 'r', errors='ignore') as fh:
+                    for i, line in enumerate(fh):
+                        if i > 500:
+                            break
+                        s = line.strip()
+                        if release_version == "Unknown":
+                            m = rx_ver.search(s)
+                            if m:
+                                release_version = m.group(1).strip()
+                        if build_date == "Unknown":
+                            m = rx_bld.search(s)
+                            if m:
+                                build_date = m.group(1).strip()
+            except Exception:
+                continue
+
+        return release_version, build_date
+
+    def get_metadata(self, mode_dirs):
+        if self._metadata_cache is not None:
+            return self._metadata_cache
+
+        rel, bld = self._parse_nimrod_version(mode_dirs)
+        self._metadata_cache = {
+            "code": self.CODE_NAME,
+            "source_directory": str(self.model_dir.resolve()),
+            "release_version": rel,
+            "build_date": bld,
+        }
+        return self._metadata_cache
+
+    def get_reproducibility_data(self, mode_dir):
+        hashes = {}
+
+        target_files = ['nimrod.in', 'nimeq.in', 'oculus.in', 'fluxgrid.in',
+                        'nimhist.bin', 'energy.bin', 'energy.txt', 'discharge.bin',
+                        'growth.bin', 'growth.txt', 'timestat.bin',
+                        'contours.h5', 'sol.grn']
+        for fname in target_files:
+            fpath = mode_dir / fname
+            if fpath.exists():
+                hashes[fname] = compute_file_hash(fpath)
+
+        for h5_file in sorted(mode_dir.glob("dumpgll.*.h5")):
+            hashes[h5_file.name] = compute_file_hash(h5_file)
+
+        eq_dump = self._get_dump_file(time=-1)
+        if eq_dump:
+            eq_path = Path(eq_dump)
+            if eq_path.name not in hashes:
+                hashes[eq_path.name] = compute_file_hash(eq_path)
+
+        return hashes
+
+    def get_all_input_parameters(self):
+        inputs = {}
+        target_files = ['nimrod.in', 'nimeq.in', 'oculus.in', 'fluxgrid.in']
+
+        for filename in target_files:
+            found_files = list(self.model_dir.rglob(filename))
+            if not found_files:
+                continue
+
+            with open(found_files[0], 'r', errors='ignore') as f:
+                for line in f:
+                    line = line.strip()
+                    if '!' in line:
+                        line = line.split('!')[0].strip()
+                    if not line or line.startswith('&') or line == '/':
+                        continue
+
+                    if '=' in line:
+                        parts = line.split('=', 1)
+                        key   = parts[0].strip()
+                        val   = parts[1].strip()
+
+                        if val.startswith("'") and val.endswith("'"):
+                            val = val[1:-1]
+                        elif val.startswith('"') and val.endswith('"'):
+                            val = val[1:-1]
+
+                        inputs[key] = auto_cast(val)
+        return inputs
+
+    # ======================================================================
+    # MODE METADATA
+    # ======================================================================
+
+    def get_mode_metadata(self, mode_dir):
+        """
+        Extracts the growth rate for the toroidal mode number corresponding to this
+        mode directory by running 'nimgrowth energy.bin'.
+        """
+        meta = {
+            "growth_rate": 0.0,
+            "frequency":   0.0,
+            "mode_type":   -100
+        }
+
+        primary_n = None
+        try:
+            primary_n = int(mode_dir.name.lstrip('n'))
+        except ValueError:
+            printwarn(f"Could not parse toroidal mode number from directory name '{mode_dir.name}'.")
+
+        growth_rates = self._get_nimgrowth_for_dir(mode_dir)
+
+        if primary_n is not None and primary_n in growth_rates:
+            meta["growth_rate"] = growth_rates[primary_n]
+        elif primary_n is not None and growth_rates:
+            printwarn(
+                f"Toroidal mode n={primary_n} (from directory '{mode_dir.name}') "
+                f"not found in nimgrowth output. Available n values: {list(growth_rates.keys())}."
+            )
+
+        return meta
+
+    def get_all_mode_entries(self, mode_dir, config):
+        """
+        Overrides the base class method to expand a single NIMROD mode directory
+        into one perturbation group per toroidal mode number found in the nimgrowth output.
+        """
+        growth_rates = self._get_nimgrowth_for_dir(mode_dir)
+
+        if not growth_rates:
+            return [(mode_dir.name, {
+                "growth_rate": 0.0,
+                "frequency":   0.0,
+                "mode_type":   -100
+            })]
+
+        entries = []
+        for n_val in sorted(growth_rates.keys()):
+            group_name = f"n{n_val:02d}"
+            mode_meta  = {
+                "growth_rate": growth_rates[n_val],
+                "frequency":   0.0,
+                "mode_type":   -100
+            }
+            entries.append((group_name, mode_meta))
+
+        return entries
+
+    def get_time_metadata(self, time_slices):
+        """
+        Builds the time metadata dict for the requested time slice indices.
+        """
+        resolved_indices = []
+        for ts in time_slices:
+            requested_idx = 0 if ts == -1 else ts
+            resolved_idx  = self._get_common_max_index(requested_idx)
+            resolved_indices.append(resolved_idx)
+
+        meta = {
+            "time_slice":           np.array(resolved_indices, dtype=int),
+            "simulation_time_step": np.zeros(len(time_slices), dtype=int),
+            "simulation_time":      np.zeros(len(time_slices), dtype=float)
+        }
+
+        ref_dir = self._mode_dirs[0] if self._mode_dirs else None
+
+        if ref_dir is not None:
+            indexed   = self._get_indexed_dumps_for_dir(ref_dir)
+            index_map = {idx: (step, path) for idx, step, path in indexed}
+            for i, idx in enumerate(resolved_indices):
+                if idx in index_map:
+                    step, path = index_map[idx]
+                    meta["simulation_time_step"][i] = step
+                    meta["simulation_time"][i] = self._read_dump_time(path)
+
+        return meta
+
+    @staticmethod
+    def _read_dump_time(dump_path):
+        """Reads the physical time stored in a NIMROD HDF5 dump (dumpTime/vsTime)."""
+        try:
+            with h5py.File(str(dump_path), 'r') as h5:
+                if 'dumpTime' in h5:
+                    g = h5['dumpTime']
+                    for key in ('vsTime', 'time', 't'):
+                        if key in g.attrs:
+                            return float(np.ravel(np.asarray(g.attrs[key], dtype=float))[0])
+                if 'time' in h5:
+                    return float(np.ravel(np.asarray(h5['time'][()], dtype=float))[0])
+        except Exception:
+            pass
+        return 0.0
+
+    # ======================================================================
+    # IMAS CONVERSION (nimrod2imas)
+    # ======================================================================
+
     def _imas_search_dirs(self, mode_dirs, parent_levels=1):
         """
         Builds the ordered list of directories searched for GEQDSK/PEQDSK files
@@ -477,6 +1936,8 @@ class NIMRODAdapter(SimulationAdapter):
         Locates the GEQDSK and PEQDSK files needed by input2imas.
         Returns (geqdsk_path_or_None, peqdsk_path_or_None).
         """
+        from .utils import _is_geqdsk_name, _is_peqdsk_name
+
         geqdsk = None
         peqdsk = None
         for d in self._imas_search_dirs(mode_dirs, parent_levels):
@@ -504,6 +1965,7 @@ class NIMRODAdapter(SimulationAdapter):
 
         Returns a dictionary summarising the created entry, or None on failure.
         """
+        self._config = config or {}
         imas_cfg = dict(config.get("imas", {}) or {})
 
         rt = _prepare_nimrod2imas_runtime(imas_cfg)
@@ -730,424 +2192,3 @@ class NIMRODAdapter(SimulationAdapter):
             printwarn(f"  -> {n_ok}/{n_all} nimrod2imas steps succeeded.")
 
         return summary
-
-    def get_time_metadata(self, time_slices):
-        """
-        Builds the time metadata dict for the requested time slice indices.
-        """
-        resolved_indices = []
-        for ts in time_slices:
-            requested_idx = 0 if ts == -1 else ts
-            resolved_idx  = self._get_common_max_index(requested_idx)
-            resolved_indices.append(resolved_idx)
-
-        meta = {
-            "time_slice":           np.array(resolved_indices, dtype=int),
-            "simulation_time_step": np.zeros(len(time_slices), dtype=int),
-            "simulation_time":      np.zeros(len(time_slices), dtype=float)
-        }
-
-        if self._mode_dirs:
-            ref_dir = self._mode_dirs[0]
-        else:
-            ref_dir = None
-
-        if ref_dir is not None:
-            indexed   = self._get_indexed_dumps_for_dir(ref_dir)
-            index_map = {idx: (step, path) for idx, step, path in indexed}
-            for i, idx in enumerate(resolved_indices):
-                if idx in index_map:
-                    step, _ = index_map[idx]
-                    meta["simulation_time_step"][i] = step
-
-        return meta
-
-    def get_reproducibility_data(self, mode_dir):
-        hashes = {}
-
-        target_files = ['nimhist.bin', 'energy.bin', 'energy.txt', 'discharge.bin',
-                        'growth.bin', 'growth.txt', 'timestat.bin']
-        for fname in target_files:
-            fpath = mode_dir / fname
-            if fpath.exists():
-                hashes[fname] = compute_file_hash(fpath)
-
-        for h5_file in mode_dir.glob("dumpgll.*.h5"):
-            hashes[h5_file.name] = compute_file_hash(h5_file)
-
-        eq_dump = self._get_dump_file(time=-1)
-        if eq_dump:
-            eq_path = Path(eq_dump)
-            if eq_path.name not in hashes:
-                hashes[eq_path.name] = compute_file_hash(eq_path)
-
-        return hashes
-
-    def _map_nimrod_field(self, name):
-        """Maps user config field names to the specific 'nvptb' fields expected by nimpy."""
-        mapping = {
-            'ne': 'n', 'ni': 'n', 'n': 'n',
-            'v': 'v',
-            'p': 'p', 'pe': 'p', 'pi': 'p',
-            'te': 't', 'ti': 't', 't': 't',
-            'b': 'b', 'B': 'b'
-        }
-        return mapping.get(name.lower(), None)
-
-    def _get_sorted_dump_files(self):
-        """
-        Returns a step-number-sorted list of valid HDF5 dump file paths from the
-        first registered nXX mode directory.
-        """
-        if self._mode_dirs:
-            indexed = self._get_indexed_dumps_for_dir(self._mode_dirs[0])
-        else:
-            indexed = []
-        return [path for _, _, path in indexed]
-
-    def _get_bounding_box(self, time=-1):
-        """
-        Reads the underlying NIMROD HDF5 dump file to dynamically find the
-        global minimum and maximum R and Z coordinates.
-        Returns: (rmin, rmax, zmin, zmax)
-        """
-        dump_file = self._get_dump_file(time)
-        if not dump_file:
-            return 1.0, 2.0, -1.0, 1.0
-
-        rmin, rmax = float('inf'), float('-inf')
-        zmin, zmax = float('inf'), float('-inf')
-
-        try:
-            with h5py.File(dump_file, 'r') as h5:
-                rblocks = h5.get('rblocks')
-                if rblocks:
-                    for block_name in rblocks.keys():
-                        rz_name = f"rz{block_name}"
-                        if rz_name in rblocks[block_name]:
-                            rzdat = rblocks[block_name][rz_name][()]
-                            r_vals = rzdat[..., 0]
-                            z_vals = rzdat[..., 1]
-                            rmin = min(rmin, np.min(r_vals))
-                            rmax = max(rmax, np.max(r_vals))
-                            zmin = min(zmin, np.min(z_vals))
-                            zmax = max(zmax, np.max(z_vals))
-
-            if rmin == float('inf'):
-                return 1.0, 2.0, -1.0, 1.0
-
-            return rmin, rmax, zmin, zmax
-
-        except Exception as e:
-            printwarn(f"Failed to read bounding box from {dump_file}: {e}")
-            return 1.0, 2.0, -1.0, 1.0
-
-    def get_2d_mesh(self, grid_spec):
-        if grid_spec.type == "rectangular":
-            rmin, rmax, zmin, zmax = self._get_bounding_box(time=-1)
-            nR, nZ = grid_spec.resolution
-            R_lin = np.linspace(rmin, rmax, nR)
-            Z_lin = np.linspace(zmin, zmax, nZ)
-            R, Z  = np.meshgrid(R_lin, Z_lin, indexing='ij')
-            return np.column_stack((R.ravel(), Z.ravel()))
-        else:
-            printwarn(f"Grid type '{grid_spec.type}' not yet implemented for NIMROD.")
-            return np.array([])
-
-    def get_3d_mesh(self, grid_spec):
-        if grid_spec.type == "rectangular":
-            rmin, rmax, zmin, zmax = self._get_bounding_box(time=-1)
-            nR, nPhi, nZ = grid_spec.resolution
-            R_lin   = np.linspace(rmin, rmax, nR)
-            Phi_lin = np.linspace(0, 2*np.pi, nPhi, endpoint=False)
-            Z_lin   = np.linspace(zmin, zmax, nZ)
-            R, phi, Z = np.meshgrid(R_lin, Phi_lin, Z_lin, indexing='ij')
-            return np.column_stack((R.ravel(), phi.ravel(), Z.ravel()))
-        else:
-            printwarn(f"Grid type '{grid_spec.type}' not yet implemented for NIMROD.")
-            return np.array([])
-
-    def get_2d_field(self, name, grid_spec, units, time=-1):
-        if not _NIMPY_AVAILABLE:
-            printwarn("nimpy is not available; cannot evaluate NIMROD fields.")
-            return np.array([])
-
-        nim_field = self._map_nimrod_field(name)
-        if not nim_field:
-            printwarn(f"Field '{name}' is not currently mapped for NIMROD extraction.")
-            return np.array([])
-
-        dump_file = self._get_dump_file(time)
-        if not dump_file:
-            return np.array([])
-
-        dump_path  = Path(dump_file).resolve()
-        target_dir = dump_path.parent
-
-        original_cwd = os.getcwd()
-        try:
-            os.chdir(target_dir)
-            eval_nimrod = EvalNimrod(str(dump_path), fieldlist='nvptb', path='./')
-
-            if grid_spec.type == "rectangular":
-                rmin, rmax, zmin, zmax = self._get_bounding_box(time)
-                nR, nZ = grid_spec.resolution
-                R_lin = np.linspace(rmin, rmax, nR)
-                Z_lin = np.linspace(zmin, zmax, nZ)
-                R, Z  = np.meshgrid(R_lin, Z_lin, indexing='ij')
-                phi   = np.zeros_like(R)
-                rzp   = np.array([R.ravel(), Z.ravel(), phi.ravel()])
-                res   = eval_nimrod.eval_field(nim_field, rzp=rzp, dmode=0, eq=2)
-
-                if res.shape[0] == 1:
-                    return res[0]
-                elif res.shape[0] == 3:
-                    return {
-                        f"{name}_R":   res[0],
-                        f"{name}_Z":   res[1],
-                        f"{name}_phi": self.PHI_SIGN_FLIP * res[2]
-                    }
-            else:
-                printwarn(f"Grid type '{grid_spec.type}' not yet implemented for NIMROD.")
-                return np.array([])
-        except Exception as e:
-            printerr(f"Error evaluating 2D field {name} in NIMROD: {e}")
-            return np.array([])
-        finally:
-            os.chdir(original_cwd)
-
-    def get_3d_field(self, name, grid_spec, units, time=-1):
-        if not _NIMPY_AVAILABLE:
-            printwarn("nimpy is not available; cannot evaluate NIMROD fields.")
-            return np.array([])
-
-        nim_field = self._map_nimrod_field(name)
-        if not nim_field:
-            printwarn(f"Field '{name}' is not currently mapped for NIMROD extraction.")
-            return np.array([])
-
-        dump_file = self._get_dump_file(time)
-        if not dump_file:
-            return np.array([])
-
-        dump_path  = Path(dump_file).resolve()
-        target_dir = dump_path.parent
-
-        original_cwd = os.getcwd()
-        try:
-            os.chdir(target_dir)
-            eval_nimrod = EvalNimrod(str(dump_path), fieldlist='nvptb', path='./')
-
-            if grid_spec.type == "rectangular":
-                rmin, rmax, zmin, zmax = self._get_bounding_box(time)
-                nR, nPhi, nZ = grid_spec.resolution
-                R_lin   = np.linspace(rmin, rmax, nR)
-                Phi_lin = np.linspace(0, 2*np.pi, nPhi, endpoint=False)
-                Z_lin   = np.linspace(zmin, zmax, nZ)
-                R, Phi, Z = np.meshgrid(R_lin, Phi_lin, Z_lin, indexing='ij')
-                rzp = np.array([R.ravel(), Z.ravel(), Phi.ravel()])
-                res = eval_nimrod.eval_field(nim_field, rzp=rzp, dmode=0, eq=2)
-
-                if res.shape[0] == 1:
-                    return res[0]
-                elif res.shape[0] == 3:
-                    return {
-                        f"{name}_R":   res[0],
-                        f"{name}_Z":   res[1],
-                        f"{name}_phi": self.PHI_SIGN_FLIP * res[2]
-                    }
-            else:
-                printwarn(f"Grid type '{grid_spec.type}' not yet implemented for NIMROD.")
-                return np.array([])
-        except Exception as e:
-            printerr(f"Error evaluating 3D field {name} in NIMROD: {e}")
-            return np.array([])
-        finally:
-            os.chdir(original_cwd)
-
-    def get_mode_metadata(self, mode_dir):
-        """
-        Extracts the growth rate for the toroidal mode number corresponding to this
-        mode directory by running 'nimgrowth energy.bin'.
-        """
-        meta = {
-            "growth_rate": 0.0,
-            "frequency":   0.0,
-            "mode_type":   -100
-        }
-
-        primary_n = None
-        try:
-            primary_n = int(mode_dir.name.lstrip('n'))
-        except ValueError:
-            printwarn(f"Could not parse toroidal mode number from directory name '{mode_dir.name}'.")
-
-        growth_rates = self._get_nimgrowth_for_dir(mode_dir)
-
-        if primary_n is not None and primary_n in growth_rates:
-            meta["growth_rate"] = growth_rates[primary_n]
-        elif primary_n is not None and growth_rates:
-            printwarn(
-                f"Toroidal mode n={primary_n} (from directory '{mode_dir.name}') "
-                f"not found in nimgrowth output. Available n values: {list(growth_rates.keys())}."
-            )
-
-        return meta
-
-    def get_all_mode_entries(self, mode_dir, config):
-        """
-        Overrides the base class method to expand a single NIMROD mode directory
-        into one perturbation group per toroidal mode number found in the nimgrowth output.
-        """
-        growth_rates = self._get_nimgrowth_for_dir(mode_dir)
-
-        if not growth_rates:
-            return [(mode_dir.name, {
-                "growth_rate": 0.0,
-                "frequency":   0.0,
-                "mode_type":   -100
-            })]
-
-        entries = []
-        for n_val in sorted(growth_rates.keys()):
-            group_name = f"n{n_val:02d}"
-            mode_meta  = {
-                "growth_rate": growth_rates[n_val],
-                "frequency":   0.0,
-                "mode_type":   -100
-            }
-            entries.append((group_name, mode_meta))
-
-        return entries
-
-    def get_mode_2d_field(self, mode_dir, name, grid_spec, units):
-        """
-        Evaluates the field at the last dump file in the given mode directory (finite time).
-        """
-        if not _NIMPY_AVAILABLE:
-            printwarn("nimpy is not available; cannot evaluate NIMROD fields.")
-            return np.array([])
-
-        nim_field = self._map_nimrod_field(name)
-        if not nim_field:
-            printwarn(f"Field '{name}' is not currently mapped for NIMROD extraction.")
-            return np.array([])
-
-        indexed = self._get_indexed_dumps_for_dir(mode_dir)
-        if not indexed:
-            printwarn(f"No dump files found in mode directory {mode_dir}.")
-            return np.array([])
-        _, _, dump_path_obj = indexed[-1]
-        dump_path  = Path(dump_path_obj).resolve()
-        target_dir = dump_path.parent
-
-        original_cwd = os.getcwd()
-        try:
-            os.chdir(target_dir)
-            eval_nimrod = EvalNimrod(str(dump_path), fieldlist='nvptb', path='./')
-            if grid_spec.type == "rectangular":
-                rmin, rmax, zmin, zmax = self._get_bounding_box(time=-1)
-                nR, nZ = grid_spec.resolution
-                R_lin = np.linspace(rmin, rmax, nR)
-                Z_lin = np.linspace(zmin, zmax, nZ)
-                R, Z  = np.meshgrid(R_lin, Z_lin, indexing='ij')
-                phi   = np.zeros_like(R)
-                rzp   = np.array([R.ravel(), Z.ravel(), phi.ravel()])
-                res   = eval_nimrod.eval_field(nim_field, rzp=rzp, dmode=0, eq=2)
-                if res.shape[0] == 1:
-                    return res[0]
-                elif res.shape[0] == 3:
-                    return {
-                        f"{name}_R":   res[0],
-                        f"{name}_Z":   res[1],
-                        f"{name}_phi": self.PHI_SIGN_FLIP * res[2]
-                    }
-            else:
-                printwarn(f"Grid type '{grid_spec.type}' not yet implemented for NIMROD.")
-                return np.array([])
-        except Exception as e:
-            printerr(f"Error evaluating mode 2D field {name} in NIMROD: {e}")
-            return np.array([])
-        finally:
-            os.chdir(original_cwd)
-
-    def get_mode_3d_field(self, mode_dir, name, grid_spec, units):
-        """
-        Evaluates the field at the last dump file in the given mode directory (finite time).
-        """
-        if not _NIMPY_AVAILABLE:
-            printwarn("nimpy is not available; cannot evaluate NIMROD fields.")
-            return np.array([])
-
-        nim_field = self._map_nimrod_field(name)
-        if not nim_field:
-            printwarn(f"Field '{name}' is not currently mapped for NIMROD extraction.")
-            return np.array([])
-
-        indexed = self._get_indexed_dumps_for_dir(mode_dir)
-        if not indexed:
-            printwarn(f"No dump files found in mode directory {mode_dir}.")
-            return np.array([])
-        _, _, dump_path_obj = indexed[-1]
-        dump_path  = Path(dump_path_obj).resolve()
-        target_dir = dump_path.parent
-
-        original_cwd = os.getcwd()
-        try:
-            os.chdir(target_dir)
-            eval_nimrod = EvalNimrod(str(dump_path), fieldlist='nvptb', path='./')
-            if grid_spec.type == "rectangular":
-                rmin, rmax, zmin, zmax = self._get_bounding_box(time=-1)
-                nR, nPhi, nZ = grid_spec.resolution
-                R_lin   = np.linspace(rmin, rmax, nR)
-                Phi_lin = np.linspace(0, 2*np.pi, nPhi, endpoint=False)
-                Z_lin   = np.linspace(zmin, zmax, nZ)
-                R, Phi, Z = np.meshgrid(R_lin, Phi_lin, Z_lin, indexing='ij')
-                rzp = np.array([R.ravel(), Z.ravel(), Phi.ravel()])
-                res = eval_nimrod.eval_field(nim_field, rzp=rzp, dmode=0, eq=2)
-                if res.shape[0] == 1:
-                    return res[0]
-                elif res.shape[0] == 3:
-                    return {
-                        f"{name}_R":   res[0],
-                        f"{name}_Z":   res[1],
-                        f"{name}_phi": self.PHI_SIGN_FLIP * res[2]
-                    }
-            else:
-                printwarn(f"Grid type '{grid_spec.type}' not yet implemented for NIMROD.")
-                return np.array([])
-        except Exception as e:
-            printerr(f"Error evaluating mode 3D field {name} in NIMROD: {e}")
-            return np.array([])
-        finally:
-            os.chdir(original_cwd)
-
-    def get_all_input_parameters(self):
-        inputs = {}
-        target_files = ['nimrod.in', 'nimeq.in', 'oculus.in', 'fluxgrid.in']
-
-        for filename in target_files:
-            found_files = list(self.model_dir.rglob(filename))
-            if not found_files:
-                continue
-
-            with open(found_files[0], 'r', errors='ignore') as f:
-                for line in f:
-                    line = line.strip()
-                    if '!' in line:
-                        line = line.split('!')[0].strip()
-                    if not line or line.startswith('&') or line == '/':
-                        continue
-
-                    if '=' in line:
-                        parts = line.split('=', 1)
-                        key   = parts[0].strip()
-                        val   = parts[1].strip()
-
-                        if val.startswith("'") and val.endswith("'"):
-                            val = val[1:-1]
-                        elif val.startswith('"') and val.endswith('"'):
-                            val = val[1:-1]
-
-                        inputs[key] = auto_cast(val)
-        return inputs
