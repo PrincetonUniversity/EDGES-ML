@@ -1,4 +1,4 @@
-# edges_ml
+# EDGES-ML
 
 **edges_ml** is a standalone Python package for building machine-learning-ready datasets
 from MHD simulation codes. Currently it supports M3D-C1 and NIMROD, but its design allows
@@ -14,10 +14,10 @@ demand, or it can make use of the IMAS schema as defined by the IMAS Data Dictio
 
 ## Supported Codes
 
-| Code      | Adapter class                              | Key dependency          |
-|-----------|--------------------------------------------|-------------------------|
-| M3D-C1    | `edges_ml.m3dc1_adapter.M3DC1Adapter`      | `fpy` (fusion-io)       |
-| NIMROD    | `edges_ml.nimrod_adapter.NIMRODAdapter`    | `nimpy`                 |
+| Code      | Adapter class                              | Dependencies                                |
+|-----------|--------------------------------------------|---------------------------------------------|
+| M3D-C1    | `edges_ml.m3dc1_adapter.M3DC1Adapter`      | `fpy` (fusion-io), `m3dc1` (Python package) |
+| NIMROD    | `edges_ml.nimrod_adapter.NIMRODAdapter`    | `nimpy`, `nimrod2imas`                      |
 
 ---
 
@@ -25,22 +25,22 @@ demand, or it can make use of the IMAS schema as defined by the IMAS Data Dictio
 
 ### Minimal (no simulation-code dependencies)
 ```bash
-pip install edges-ml
+pip install edges_ml
 ```
 
 ### M3D-C1 users
 ```bash
-pip install "edges-ml[m3dc1]"
+pip install "edges_ml[m3dc1]"
 ```
 
 ### NIMROD users
 ```bash
-pip install "edges-ml[nimrod]"
+pip install "edges_ml[nimrod]"
 ```
 
 ### Everything
 ```bash
-pip install "edges-ml[all]"
+pip install "edges_ml[all]"
 ```
 
 ---
@@ -85,42 +85,20 @@ Documentation is available at https://imas-python.readthedocs.io/en/stable/index
 
 ## Quick Start
 
-### Python API
+After installing EDGES-ML and its dependencies, running EDGES-ML to export data in an ML-ready format
+is rather straightforward:
 
-```python
-from edges_ml import build_dataset
-
-sources = [
-    {
-        "code": "m3dc1",
-        "directories": ["/path/to/m3dc1/runs"],
-    }
-]
-
-config = {
-    "units": "SI",
-    "fcoords": "pest",
-    "flux_averages": ["p", "q", "te", "ne"],
-    "2d_fields": ["p", "j"],
-    "output_format": "reduced_h5",
-}
-
-build_dataset(sources, "/path/to/output", config)
-```
-
-### Command Line
-
-```bash
-edges-build-dataset --config configs/example_m3dc1.yaml
-```
+The user defines a `config` dictionary to select the data to be exported, and the runs
+`build_dataset()`. Please see the examples in the `examples` directory on how to export
+data from M3D-C1 and NIMROD in the supported output formats.
 
 ---
 
 ## Configuration Reference
 
-See `configs/example_m3dc1.yaml` and `configs/example_nimrod.yaml` for annotated examples.
+See files in the `examples` directory for reference.
 
-Key top-level config keys:
+Top-level config keys:
 
 | Key                      | Default          | Description                                      |
 |--------------------------|------------------|--------------------------------------------------|
