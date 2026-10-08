@@ -3,6 +3,16 @@ M3D-C1 adapter for edges-ml.
 
 Contains the M3DC1Adapter class, which implements the SimulationAdapter
 interface for M3D-C1 HDF5 output files.
+
+The adapter works in two modes:
+
+*local*
+    'model_dir' is a directory on this machine containing nXX/C1.h5 files.
+
+*campaign (ADIOS2 .aca streaming)*
+    'campaign' is a CampaignContext describing a remote simulation registered
+    in an HPC campaign archive.  Every fpy.sim_data object is then opened with
+    filetype='adios2' and the data is streamed over SSH on demand.
 """
 
 import os
@@ -36,6 +46,7 @@ except ImportError:
     print("Warning: fpy or m3dc1 modules not found. M3D-C1 extraction will fail if called.")
 
 from .base import SimulationAdapter
+from .campaign import CampaignArchive, CampaignContext
 from .utils import (
     printwarn, printerr, printnote,
     compute_file_hash, auto_cast, generate_unique_filename,
@@ -48,8 +59,12 @@ class M3DC1Adapter(SimulationAdapter):
 
     CODE_NAME = "M3D-C1"
 
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, campaign=None):
         super().__init__(model_dir)
+
+        # Campaign archive streaming context (None for local data).
+        self.campaign = campaign
+
         # Cache to store the (R, Z) points of the inner wall
         self._inner_wall_points = None
 
@@ -58,16 +73,27 @@ class M3DC1Adapter(SimulationAdapter):
         self._mode_sims = {}
         self._time_sims = {}
 
+        # Mode directories (local paths) or campaign simulation paths.
+        if campaign is not None and getattr(campaign, "modes", None):
+            self._mode_dirs = [Path(m) for m in campaign.modes]
+        else:
+            self._mode_dirs = []
+
         # Internal state for Slurm file metadata
         self._slurm_parsed = False
         self._slurm_rel_ver = "Unknown"
         self._slurm_bld_date = "Unknown"
         self._slurm_inputs = {}
 
-        # Look for the Gamma growth rate file inside the parent model directory
+        # Look for the Gamma growth rate file inside the parent model directory.
+        # This is only possible for locally available data.
         self.gamma_data = None
-        if _M3DC1_AVAILABLE:
-            for f in self.model_dir.iterdir():
+        if _M3DC1_AVAILABLE and self.campaign is None and self.model_dir.is_dir():
+            try:
+                entries = list(self.model_dir.iterdir())
+            except OSError:
+                entries = []
+            for f in entries:
                 if f.is_file() and f.suffix in ['.txt', '.dat', '.out', '']:
                     try:
                         with open(f, 'r') as tmp:
@@ -78,46 +104,129 @@ class M3DC1Adapter(SimulationAdapter):
                     except Exception:
                         pass
 
+    # -----------------------------------------------------------------------
+    # Campaign / local plumbing
+    # -----------------------------------------------------------------------
+
+    @property
+    def is_campaign(self):
+        return self.campaign is not None
+
+    def set_mode_dirs(self, mode_dirs):
+        """
+        Registers the mode (nXX) directories — or, in campaign mode, the
+        simulation paths inside the archive — that belong to this model.
+        """
+        self._mode_dirs = [Path(d) for d in (mode_dirs or [])]
+
+    def _primary_target(self):
+        """
+        Returns the 'thing' that identifies this model for fpy:
+        a local C1.h5 path, or a campaign simulation path.
+        """
+        if self.is_campaign:
+            if self._mode_dirs:
+                return str(self._mode_dirs[0]).strip('/')
+            if self.campaign.simulation:
+                return str(self.campaign.simulation).strip('/')
+            return None
+
+        c1_paths = list(self.model_dir.rglob("C1.h5"))
+        if not c1_paths:
+            return None
+        return str(c1_paths[0])
+
+    def _sim_filename(self):
+        """Filename that is handed to the m3dc1 helper routines."""
+        if self.is_campaign:
+            return str(self.campaign.archive)
+        target = self._primary_target()
+        return target if target else str(self.model_dir / "C1.h5")
+
+    def _open_sim(self, target, time):
+        """
+        Opens an fpy.sim_data object.
+
+        target : str
+            Local path to a C1.h5 file, or (campaign mode) the simulation path
+            inside the campaign archive.
+        """
+        if not _M3DC1_AVAILABLE:
+            raise NameError("fpy is not available")
+
+        if self.is_campaign:
+            kwargs = self.campaign.sim_data_kwargs(simulation=target, time=time)
+            if self.campaign.verbose:
+                printnote(
+                    f"Streaming {kwargs['campaign_simulation']} "
+                    f"(time={time}) from {self.campaign.describe()}"
+                )
+            return fpy.sim_data(**kwargs)
+
+        return fpy.sim_data(filename=str(target), time=time)
+
     def _get_eq_sim(self):
         """
         Lazily loads the shared equilibrium simulation object (time=-1).
-        Searches the model directory for any valid C1.h5 file to initialize it.
         """
         if self._eq_sim is None:
-            c1_paths = list(self.model_dir.rglob("C1.h5"))
-            if not c1_paths:
+            target = self._primary_target()
+            if target is None:
+                if self.is_campaign:
+                    printerr(
+                        f"No campaign simulation registered for {self.model_dir}.")
+                    return None
                 raise FileNotFoundError(f"No C1.h5 files found in {self.model_dir}")
             try:
-                self._eq_sim = fpy.sim_data(filename=str(c1_paths[0]), time=-1)
+                self._eq_sim = self._open_sim(target, -1)
             except NameError:
                 pass
+            except Exception as exc:
+                printerr(f"Could not open equilibrium simulation ({target}): {exc}")
+                self._eq_sim = None
         return self._eq_sim
 
     def _get_mode_sim(self, mode_dir):
         """
         Lazily loads the simulation object for a mode directory at time='last'.
         """
-        if mode_dir not in self._mode_sims:
-            c1_path = mode_dir / 'C1.h5'
+        key = Path(mode_dir)
+        if key not in self._mode_sims:
+            if self.is_campaign:
+                target = str(key).strip('/')
+            else:
+                target = str(key / 'C1.h5')
             try:
-                self._mode_sims[mode_dir] = fpy.sim_data(filename=str(c1_path), time='last')
+                self._mode_sims[key] = self._open_sim(target, 'last')
             except NameError:
-                pass
-        return self._mode_sims[mode_dir]
+                self._mode_sims[key] = None
+            except Exception as exc:
+                printerr(f"Could not open mode simulation ({target}): {exc}")
+                self._mode_sims[key] = None
+        return self._mode_sims.get(key)
 
     def _get_time_sim(self, time_slice):
         """
         Lazily loads the specific simulation object for a selected time slice.
         """
         if time_slice not in self._time_sims:
-            c1_paths = list(self.model_dir.rglob("C1.h5"))
-            if not c1_paths:
+            target = self._primary_target()
+            if target is None:
                 return None
             try:
-                self._time_sims[time_slice] = fpy.sim_data(filename=str(c1_paths[0]), time=time_slice)
+                self._time_sims[time_slice] = self._open_sim(target, time_slice)
             except NameError:
                 return None
-        return self._time_sims[time_slice]
+            except Exception as exc:
+                printerr(f"Could not open simulation for time slice {time_slice}: {exc}")
+                self._time_sims[time_slice] = None
+        return self._time_sims.get(time_slice)
+
+    def close(self):
+        """Drops the cached fpy objects (closing SSH connections in campaign mode)."""
+        self._eq_sim = None
+        self._mode_sims = {}
+        self._time_sims = {}
 
     def _map_units(self, units):
         """Translates generalized config units into M3D-C1 specific unit strings."""
@@ -125,6 +234,10 @@ class M3DC1Adapter(SimulationAdapter):
         if u == 'codeunits':
             return 'm3dc1'
         return u
+
+    # -----------------------------------------------------------------------
+    # Metadata / inputs
+    # -----------------------------------------------------------------------
 
     def _parse_slurm_data(self, mode_dirs):
         """
@@ -134,9 +247,15 @@ class M3DC1Adapter(SimulationAdapter):
         release_version = "Unknown"
         build_date = "Unknown"
         inputs = {}
+
+        # Slurm logs are not part of the campaign archive.
+        if self.is_campaign:
+            return release_version, build_date, inputs
+
         candidates = []
 
         for mdir in mode_dirs:
+            mdir = Path(mdir)
             for out_file in mdir.glob("slurm*.out"):
                 candidates.append(out_file)
             for out_file in mdir.glob("*.out"):
@@ -206,7 +325,32 @@ class M3DC1Adapter(SimulationAdapter):
 
         return release_version, build_date, inputs
 
+    def _campaign_metadata(self):
+        """Metadata for a simulation streamed from a campaign archive."""
+        output_version = "Unknown"
+        try:
+            sim = self._get_eq_sim()
+            if sim is not None:
+                output_version = str(sim.get_constants().version)
+        except Exception:
+            pass
+
+        return {
+            "code":                self.CODE_NAME,
+            "source_directory":    str(self.campaign.simulation),
+            "data_access":         "campaign_archive",
+            "campaign_archive":    str(self.campaign.archive),
+            "campaign_simulation": str(self.campaign.simulation),
+            "campaign_login":      str(self.campaign.login or "local"),
+            "output_version":      output_version,
+            "release_version":     "Unknown",
+            "build_date":          "Unknown",
+        }
+
     def get_metadata(self, mode_dirs):
+        if self.is_campaign:
+            return self._campaign_metadata()
+
         if not self._slurm_parsed:
             rel_ver, bld_date, inputs = self._parse_slurm_data(mode_dirs)
             self._slurm_rel_ver = rel_ver
@@ -217,13 +361,30 @@ class M3DC1Adapter(SimulationAdapter):
         return {
             "code": self.CODE_NAME,
             "source_directory": str(self.model_dir.resolve()),
+            "data_access": "local",
             "release_version": self._slurm_rel_ver,
             "build_date": self._slurm_bld_date
         }
 
     def get_reproducibility_data(self, mode_dir):
-        """Extracts hashes for crucial data files inside the mode directory."""
+        """
+        Extracts hashes for crucial data files inside the mode directory.
+
+        In campaign mode the files are remote, so the archive's dataset UUIDs
+        are recorded instead of local checksums.
+        """
+        if self.is_campaign:
+            info = {"campaign_simulation": str(mode_dir).strip('/')}
+            try:
+                archive = CampaignArchive.open(self.campaign.archive)
+                for basename, meta in sorted(archive.files_for(mode_dir).items()):
+                    info[basename] = meta.get("uuid", "")
+            except Exception as exc:
+                printwarn(f"Could not read dataset UUIDs for {mode_dir}: {exc}")
+            return info
+
         hashes = {}
+        mode_dir = Path(mode_dir)
 
         c1_path = mode_dir / 'C1.h5'
         if c1_path.exists():
@@ -240,6 +401,8 @@ class M3DC1Adapter(SimulationAdapter):
 
     def get_all_input_parameters(self):
         """Retrieve input parameters parsed from the Slurm output file."""
+        if self.is_campaign:
+            return {}
         return getattr(self, '_slurm_inputs', {})
 
     def get_global_parameters(self):
@@ -266,6 +429,10 @@ class M3DC1Adapter(SimulationAdapter):
             printwarn(f"Warning: Could not calculate shaping parameters: {e}")
 
         return globals_dict
+
+    # -----------------------------------------------------------------------
+    # Meshes and fields
+    # -----------------------------------------------------------------------
 
     def get_1d_mesh(self, resolution, units, fcoords):
         """Extracts the 1D radial grid used by flux_average."""
@@ -332,6 +499,8 @@ class M3DC1Adapter(SimulationAdapter):
 
     def get_2d_field(self, name, grid_spec, units, time=-1):
         sim = self._get_eq_sim() if time == -1 else self._get_time_sim(time)
+        if sim is None:
+            return np.array([])
         m3dc1_units = self._map_units(units)
 
         if grid_spec.type == "rectangular":
@@ -344,6 +513,8 @@ class M3DC1Adapter(SimulationAdapter):
 
     def get_3d_field(self, name, grid_spec, units, time=-1):
         sim = self._get_eq_sim() if time == -1 else self._get_time_sim(time)
+        if sim is None:
+            return np.array([])
         m3dc1_units = self._map_units(units)
 
         if grid_spec.type == "rectangular":
@@ -424,7 +595,7 @@ class M3DC1Adapter(SimulationAdapter):
 
         if self.gamma_data is not None:
             try:
-                n_val = int(mode_dir.name.replace('n', ''))
+                n_val = int(Path(mode_dir).name.replace('n', ''))
                 idx_array = np.where(self.gamma_data.n_list == n_val)[0]
                 if len(idx_array) > 0:
                     idx = idx_array[0]
@@ -451,6 +622,8 @@ class M3DC1Adapter(SimulationAdapter):
         the equilibrium field (time=-1) from this result.
         """
         sim = self._get_mode_sim(mode_dir)
+        if sim is None:
+            return np.array([])
         m3dc1_units = self._map_units(units)
         if grid_spec.type == "rectangular":
             return self._evaluate_rectangular_grid(name, grid_spec, sim, m3dc1_units, is_3d=False)
@@ -467,6 +640,8 @@ class M3DC1Adapter(SimulationAdapter):
         the equilibrium field (time=-1) from this result.
         """
         sim = self._get_mode_sim(mode_dir)
+        if sim is None:
+            return np.array([])
         m3dc1_units = self._map_units(units)
         if grid_spec.type == "rectangular":
             return self._evaluate_rectangular_grid(name, grid_spec, sim, m3dc1_units, is_3d=True)
@@ -483,9 +658,7 @@ class M3DC1Adapter(SimulationAdapter):
             "simulation_time":       np.zeros(len(time_slices), dtype=float)
         }
 
-        c1_paths = list(self.model_dir.rglob("C1.h5"))
-        c1_file  = str(c1_paths[0]) if c1_paths else "C1.h5"
-        file_dir = c1_paths[0].parent if c1_paths else self.model_dir
+        c1_file = self._sim_filename()
 
         for i, ts in enumerate(time_slices):
             sim = self._get_eq_sim() if ts == -1 else self._get_time_sim(ts)
@@ -495,12 +668,7 @@ class M3DC1Adapter(SimulationAdapter):
 
             h5file = sim._all_attrs
 
-            if ts == -1:
-                fname = "equilibrium.h5"
-            else:
-                fname = f"time_{ts:03d}.h5"
-
-            file_path = str(file_dir / fname)
+            fname = "equilibrium.h5" if ts == -1 else f"time_{ts:03d}.h5"
 
             try:
                 meta["simulation_time"][i] = get_time_of_slice(ts, sim=sim, filename=c1_file, units='m3dc1')
@@ -524,12 +692,21 @@ class M3DC1Adapter(SimulationAdapter):
 
         Returns a dictionary summarising the produced artefact, or None on failure.
         """
+        if self.is_campaign:
+            printwarn(
+                "IMAS conversion is not supported for campaign-archive (remote) "
+                f"data: {self.campaign.describe()}. "
+                "Use output_format='reduced_h5' / 'reduced_bp' instead, or run "
+                "the conversion on the remote host."
+            )
+            return None
+
         conversion_lib = str(
             config.get("m3dc1_imas_conversion_lib", "standalone")
         ).strip().lower()
 
         target_filename = (
-            str(mode_dirs[0] / 'C1.h5') if mode_dirs
+            str(Path(mode_dirs[0]) / 'C1.h5') if mode_dirs
             else str(self.model_dir / 'C1.h5')
         )
 

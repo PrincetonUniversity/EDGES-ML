@@ -11,6 +11,10 @@ Shared utilities, label registries, and IMAS helpers live in:
 
     edges_ml/utils.py
     edges_ml/base.py
+
+Remote data access (ADIOS2 campaign archives) lives in:
+
+    edges_ml/campaign.py
 """
 
 import os
@@ -36,6 +40,9 @@ from .utils import (
     AVAILABLE_1D_PROFILES, AVAILABLE_2D_FIELDS, AVAILABLE_3D_FIELDS,
     AVAILABLE_FLUX_AVERAGES, AVAILABLE_TIME_TRACES, AVAILABLE_INPUTS,
     _record_imas_manifest,
+)
+from .campaign import (
+    is_campaign_source, context_from_source, group_campaign_source,
 )
 from .base import SimulationAdapter
 from .m3dc1_adapter import M3DC1Adapter
@@ -93,17 +100,59 @@ def write_array_group(parent, name, data_dict, unit_mapping=None, desc_mapping=N
 # DIRECTORY DISCOVERY
 # ===========================================================================
 
-def group_simulation_directories(sources):
+def group_simulation_directories(sources, return_contexts=False):
     """
-    Crawls the file system based on the defined sources to find valid data.
-    Groups the discovered toroidal modes under their parent model directories.
-    Returns: { (model_dir, code): [mode_dir1, mode_dir2, ...] }
+    Crawls the file system (or an ADIOS2 campaign archive) based on the defined
+    sources to find valid data.  Groups the discovered toroidal modes under
+    their parent model directories.
+
+    Returns
+    -------
+    grouped : dict
+        { (model_dir, code): [mode_dir1, mode_dir2, ...] }
+        For campaign sources, *model_dir* is '<archive stem>/<model path>' and
+        the mode entries are the simulation paths inside the archive.
+    contexts : dict, optional
+        { (model_dir, code): CampaignContext } for remote sources.
+        Only returned when return_contexts=True.
     """
-    grouped = defaultdict(list)
+    grouped  = defaultdict(list)
+    contexts = {}
 
     for source in sources:
         code = source.get("code", "unknown").lower()
 
+        # -------------------------------------------------------------------
+        # Remote data: ADIOS2 campaign archive (.aca)
+        # -------------------------------------------------------------------
+        if is_campaign_source(source):
+            if code != "m3dc1":
+                printwarn(
+                    f"Campaign-archive streaming is currently only implemented for "
+                    f"'m3dc1' sources (got '{code}'). Skipping."
+                )
+                continue
+
+            try:
+                ctx     = context_from_source(source)
+                entries = group_campaign_source(source, ctx)
+            except Exception as exc:
+                printerr(f"Could not read campaign archive for source {source}: {exc}")
+                continue
+
+            for model_path, mode_paths in entries:
+                key_model = Path(ctx.archive_name) / model_path
+                key       = (key_model, code)
+                for mp in mode_paths:
+                    p = Path(mp)
+                    if p not in grouped[key]:
+                        grouped[key].append(p)
+                contexts[key] = ctx.with_simulation(model_path, mode_paths)
+            continue
+
+        # -------------------------------------------------------------------
+        # Local data
+        # -------------------------------------------------------------------
         target_models = source.get("model", None)
         if isinstance(target_models, str):
             target_models = [target_models]
@@ -142,7 +191,31 @@ def group_simulation_directories(sources):
                         if mode_dir not in grouped[(model_dir, code)]:
                             grouped[(model_dir, code)].append(mode_dir)
 
+    if return_contexts:
+        return grouped, contexts
     return grouped
+
+
+# ===========================================================================
+# ADAPTER FACTORY
+# ===========================================================================
+
+def _make_adapter(code, model_dir, mode_dirs, campaign=None):
+    """
+    Instantiates the adapter matching *code*, wiring in the campaign context
+    and the list of mode directories where applicable.
+    """
+    if code == "m3dc1":
+        adapter = M3DC1Adapter(model_dir, campaign=campaign)
+        adapter.set_mode_dirs(mode_dirs)
+        return adapter
+
+    if code == "nimrod":
+        adapter = NIMRODAdapter(model_dir)
+        adapter.set_mode_dirs(mode_dirs)
+        return adapter
+
+    return None
 
 
 # ===========================================================================
@@ -183,7 +256,7 @@ def build_dataset(sources, output_directory, config):
             master_unit_mapping[k] = v[1]
         master_unit_mapping["time"] = "s"
 
-    grouped = group_simulation_directories(sources)
+    grouped, campaign_contexts = group_simulation_directories(sources, return_contexts=True)
 
     if not grouped:
         printwarn("Warning: No valid simulation directories were found. Please check your source paths!")
@@ -196,7 +269,9 @@ def build_dataset(sources, output_directory, config):
         if shared_grid_source == "first":
             for (m_dir, m_code), m_dirs in grouped.items():
                 if m_code == "m3dc1":
-                    tmp_adapter = M3DC1Adapter(m_dir)
+                    tmp_ctx     = campaign_contexts.get((m_dir, m_code))
+                    tmp_adapter = M3DC1Adapter(m_dir, campaign=tmp_ctx)
+                    tmp_adapter.set_mode_dirs(m_dirs)
                     shared_inner_wall_points = tmp_adapter._get_inner_wall_points()
                     tmp_adapter.close()
                     break
@@ -208,7 +283,12 @@ def build_dataset(sources, output_directory, config):
             printwarn(f"Shared grid source '{shared_grid_source}' not found or invalid. Defaulting to local grids.")
 
     for (model_dir, code), mode_dirs in grouped.items():
-        print(model_dir)
+        campaign = campaign_contexts.get((model_dir, code))
+
+        if campaign is not None:
+            printnote(f"[campaign] {campaign.describe()}")
+        else:
+            print(model_dir)
 
         out_name = generate_unique_filename(model_dir, code)
         out_file = output_directory / out_name
@@ -224,12 +304,8 @@ def build_dataset(sources, output_directory, config):
             counter += 1
 
         if output_format == "reduced_h5":
-            if code == "m3dc1":
-                adapter = M3DC1Adapter(model_dir)
-            elif code == "nimrod":
-                adapter = NIMRODAdapter(model_dir)
-                adapter.set_mode_dirs(mode_dirs)
-            else:
+            adapter = _make_adapter(code, model_dir, mode_dirs, campaign=campaign)
+            if adapter is None:
                 print(f"Skipping {model_dir}: Unsupported code '{code}'")
                 continue
 
@@ -293,7 +369,7 @@ def build_dataset(sources, output_directory, config):
 
                 grp_modes = h5.create_group("perturbations")
                 for mode_dir in mode_dirs:
-                    mode_name = mode_dir.name
+                    mode_name = Path(mode_dir).name
 
                     repro_hashes  = adapter.get_reproducibility_data(mode_dir)
                     grp_hash_mode = grp_hashes.create_group(mode_name)
@@ -315,6 +391,8 @@ def build_dataset(sources, output_directory, config):
                         write_array_group(grp_mode, "3d_fields", mode_data["3d_fields"],
                                           unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)
 
+            adapter.close()
+
         elif output_format == "reduced_bp":
             try:
                 import adios2
@@ -322,12 +400,8 @@ def build_dataset(sources, output_directory, config):
                 printwarn("ADIOS2 is not installed. Cannot write .bp files.")
                 continue
 
-            if code == "m3dc1":
-                adapter = M3DC1Adapter(model_dir)
-            elif code == "nimrod":
-                adapter = NIMRODAdapter(model_dir)
-                adapter.set_mode_dirs(mode_dirs)
-            else:
+            adapter = _make_adapter(code, model_dir, mode_dirs, campaign=campaign)
+            if adapter is None:
                 print(f"Skipping {model_dir}: Unsupported code '{code}'")
                 continue
 
@@ -407,7 +481,7 @@ def build_dataset(sources, output_directory, config):
 
                 seen_bp_entries = set()
                 for mode_dir in mode_dirs:
-                    mode_name = mode_dir.name
+                    mode_name = Path(mode_dir).name
 
                     repro_hashes = adapter.get_reproducibility_data(mode_dir)
                     write_adios_recursive(fh, repro_hashes, f"metadata/file_hashes/{mode_name}")
@@ -427,9 +501,12 @@ def build_dataset(sources, output_directory, config):
                         write_adios_recursive(fh, mode_data["3d_fields"], f"perturbations/{entry_name}/3d_fields",
                                               unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)
 
+            adapter.close()
+
         elif output_format == "imas_h5":
             if code == "m3dc1":
-                adapter = M3DC1Adapter(model_dir)
+                adapter = M3DC1Adapter(model_dir, campaign=campaign)
+                adapter.set_mode_dirs(mode_dirs)
                 if shared_inner_wall_points is not None:
                     adapter.shared_inner_wall_points = shared_inner_wall_points
                 info = adapter.convert_to_imas(mode_dirs, output_directory, config, out_file=out_file)

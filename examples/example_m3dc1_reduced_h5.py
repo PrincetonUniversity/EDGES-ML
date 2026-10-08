@@ -38,7 +38,7 @@ config = {
     "output_format": 'reduced_h5', # Options are 'reduced_h5', 'reduced_bp', 'imas_h5'
 }
 
-# Explicit mapping of source directories to their underlying codes
+# Source directories for each code
 data_sources = [
     {
         "code": "m3dc1",

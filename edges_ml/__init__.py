@@ -7,12 +7,20 @@ Public API
     from edges_ml import M3DC1Adapter, NIMRODAdapter
     from edges_ml import SimulationAdapter
     from edges_ml import GridSpec
+    from edges_ml import CampaignArchive, CampaignContext
 """
 
 __version__ = "0.1.0"
 
 from .utils import GridSpec
 from .base import SimulationAdapter
+from .campaign import (
+    CampaignArchive,
+    CampaignContext,
+    context_from_source,
+    group_campaign_source,
+    is_campaign_source,
+)
 from .edges_ml import build_dataset, group_simulation_directories
 
 # Optional, dependency-heavy adapters.  They are allowed to be unavailable
@@ -57,6 +65,16 @@ def available_adapters():
     }
 
 
+def list_campaign_simulations(archive):
+    """
+    Convenience helper: list the simulations registered in a .aca file.
+
+        >>> edges_ml.list_campaign_simulations("mastu_45272_vped477.aca")
+        ['99/1f_eqrotnc-C_eta_x1/n40', ...]
+    """
+    return CampaignArchive.open(archive).list_simulations()
+
+
 __all__ = [
     "__version__",
     "build_dataset",
@@ -65,6 +83,12 @@ __all__ = [
     "M3DC1Adapter",
     "NIMRODAdapter",
     "GridSpec",
+    "CampaignArchive",
+    "CampaignContext",
+    "context_from_source",
+    "group_campaign_source",
+    "is_campaign_source",
+    "list_campaign_simulations",
     "adapter_import_error",
     "available_adapters",
 ]
