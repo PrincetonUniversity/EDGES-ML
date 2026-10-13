@@ -8,6 +8,7 @@ Public API
     from edges_ml import SimulationAdapter
     from edges_ml import GridSpec
     from edges_ml import CampaignArchive, CampaignContext
+    from edges_ml import build_browser
 """
 
 __version__ = "0.1.0"
@@ -22,6 +23,14 @@ from .campaign import (
     is_campaign_source,
 )
 from .edges_ml import build_dataset, group_simulation_directories
+
+# Static HTML browser generator (standard library only, always available).
+from .browser import (
+    build_browser,
+    discover_simulations,
+    describe_simulation,
+    parse_namelist,
+)
 
 # Optional, dependency-heavy adapters.  They are allowed to be unavailable
 # (missing fpy / nimpy / imas ...), but we keep the original exception around
@@ -91,4 +100,8 @@ __all__ = [
     "list_campaign_simulations",
     "adapter_import_error",
     "available_adapters",
+    "build_browser",
+    "discover_simulations",
+    "describe_simulation",
+    "parse_namelist",
 ]
