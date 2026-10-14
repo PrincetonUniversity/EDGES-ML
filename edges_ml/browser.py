@@ -16,6 +16,21 @@ code input namelists.  A "Plots" tab is already present; it stays empty (with
 a placeholder note) unless image files are discovered (``--scan-plots``), so
 that plotting can be added later without touching the HTML template.
 
+Keeping the page small
+----------------------
+The embedded data model is *packed* before it is written:
+
+* namelists are shipped as raw text only and parsed in the browser on demand
+  (the parsed parameter table used to roughly double the payload),
+* identical file contents are stored once in a shared text pool,
+* nodes are stored as a flat array of arrays with parent indices; absolute
+  paths, descendant counts and inherited summaries are reconstructed in the
+  browser instead of being repeated for every entry,
+* repeated row labels are replaced by indices into a label dictionary,
+* long numbered file series (``dumpgll.00001`` ...) are collapsed into one row,
+* the resulting JSON is gzip + base64 encoded and inflated in the page with
+  ``DecompressionStream`` (use ``--no-compress`` if that is not available).
+
 Typical use
 -----------
     $ python -m edges_ml.browser /scratch/mastu_runs -o simulations.html
@@ -29,6 +44,8 @@ Python API
 """
 
 import argparse
+import base64
+import gzip
 import json
 import os
 import re
@@ -45,6 +62,7 @@ __all__ = [
     "discover_simulations",
     "parse_namelist",
     "describe_simulation",
+    "render_html",
     "main",
 ]
 
@@ -57,6 +75,9 @@ CODE_LABELS = {
     "m3dc1":  "M3D-C1",
     "nimrod": "NIMROD",
 }
+
+# Order used to encode the code of a node as a small integer.
+CODE_ORDER = ["", "m3dc1", "nimrod"]
 
 # File that marks a directory as a simulation (mode) directory.
 SIM_MARKERS = {
@@ -85,9 +106,11 @@ SKIP_DOC_SUFFIXES = {".h5", ".bin", ".bp", ".nc", ".so", ".o", ".a", ".png",
 
 DEFAULT_MAX_DOC_BYTES = 256 * 1024     # text shown per input file
 HARD_DOC_SIZE_LIMIT   = 8 * 1024 * 1024
-DEFAULT_MAX_FILES     = 400            # entries shown in the file listing
+DEFAULT_MAX_FILES     = 200            # entries shown in the file listing
+COLLAPSE_THRESHOLD    = 5              # collapse numbered series of >= N files
 
 KIND_ORDER = {"root": 0, "folder": 1, "model": 2, "simulation": 3}
+KIND_CODES = {"root": 0, "folder": 1, "model": 2, "simulation": 3}
 
 _TRUE_WORDS  = {".true.", ".t.", "t", "true", "yes", "y", "on"}
 _FALSE_WORDS = {".false.", ".f.", "f", "false", "no", "n", "off"}
@@ -116,11 +139,18 @@ def _human_size(nbytes):
     return ""
 
 
-def _mtime_str(path):
+def _mtime(path):
     try:
-        return _dt.datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+        return int(path.stat().st_mtime)
     except OSError:
+        return 0
+
+
+def _mtime_str(path):
+    stamp = _mtime(path)
+    if not stamp:
         return ""
+    return _dt.datetime.fromtimestamp(stamp).strftime("%Y-%m-%d %H:%M")
 
 
 def _is_relative_to(path, other):
@@ -129,15 +159,6 @@ def _is_relative_to(path, other):
         return True
     except ValueError:
         return False
-
-
-def _rel_posix(path, root):
-    try:
-        rel = Path(path).relative_to(root)
-    except ValueError:
-        return str(path)
-    s = rel.as_posix()
-    return "" if s == "." else s
 
 
 def _toroidal_from_name(name):
@@ -149,15 +170,6 @@ def _toroidal_from_name(name):
     if m:
         return int(m.group(1))
     return None
-
-
-class _IdGen(object):
-    def __init__(self):
-        self._n = 0
-
-    def __call__(self):
-        self._n += 1
-        return "n%d" % self._n
 
 
 # ===========================================================================
@@ -678,7 +690,11 @@ def _normalize_sources(sources):
 # DOCUMENT / PLOT / FILE COLLECTION
 # ===========================================================================
 
-def _read_document(path, max_bytes, parse=True):
+def _read_document(path, max_bytes):
+    """
+    Reads one input file.  Only the raw text is kept - the parameter table is
+    produced in the browser, which keeps the embedded payload small.
+    """
     try:
         size = path.stat().st_size
     except OSError:
@@ -696,23 +712,12 @@ def _read_document(path, max_bytes, parse=True):
     if truncated:
         text = text[:max_bytes]
 
-    params = []
-    if parse and "=" in text:
-        try:
-            groups, _flat = parse_namelist(text)
-            for gname, kv in groups.items():
-                for key, val in kv.items():
-                    params.append([gname, key, clean_value(val)])
-        except Exception:
-            params = []
-
     return {
         "name":      path.name,
-        "path":      str(path),
-        "size":      _human_size(size),
+        "size":      int(size),
         "truncated": bool(truncated),
         "text":      text,
-        "params":    params,
+        "readme":    path.name.lower().startswith("readme"),
     }
 
 
@@ -744,8 +749,7 @@ def _collect_documents(directory, code, max_bytes, extra_files=()):
 
     docs = []
     for name, path in found.items():
-        parse = not name.lower().startswith("readme")
-        doc = _read_document(path, max_bytes, parse=parse)
+        doc = _read_document(path, max_bytes)
         if doc is not None:
             docs.append(doc)
     return docs
@@ -759,12 +763,14 @@ def _primary_params(code, documents):
         key=lambda d: wanted.index(d["name"].lower()) if d["name"].lower() in wanted else 99,
     )
     for doc in ordered:
-        if not doc.get("params"):
+        if doc.get("readme") or "=" not in doc.get("text", ""):
             continue
-        flat = OrderedDict()
-        for _group, key, val in doc["params"]:
-            flat[key.split("(")[0].strip().lower()] = val
-        return flat, doc["name"]
+        try:
+            _groups, flat = parse_namelist(doc["text"])
+        except Exception:
+            continue
+        if flat:
+            return flat, doc["name"]
     return OrderedDict(), None
 
 
@@ -798,23 +804,58 @@ def _collect_plots(directory, output_dir, scan):
     return plots
 
 
+_DIGITS_RE = re.compile(r'\d+')
+
+
 def _list_files(directory, limit):
-    rows = []
+    """
+    Compact directory listing.
+
+    Rows are ``[name, size, mtime]`` with ``size = -1`` for directories and
+    ``size = None`` for informational rows; long numbered series are collapsed
+    into a single row ``[pattern, total_size, newest_mtime, count]``.
+    """
+    if limit is not None and limit <= 0:
+        return []
+
     try:
         entries = sorted(directory.iterdir(), key=lambda q: _natural_key(q.name))
     except OSError:
-        return rows
+        return []
+
+    dir_rows = []
+    files = []
     for p in entries:
-        if len(rows) >= limit:
-            rows.append(["... (listing truncated)", "", ""])
-            break
+        try:
+            st = p.stat()
+        except OSError:
+            st = None
+        stamp = int(st.st_mtime) if st else 0
         if p.is_dir():
-            rows.append([p.name + "/", "directory", _mtime_str(p)])
+            dir_rows.append([p.name + "/", -1, stamp])
         else:
-            try:
-                rows.append([p.name, _human_size(p.stat().st_size), _mtime_str(p)])
-            except OSError:
-                rows.append([p.name, "", ""])
+            files.append((p.name, int(st.st_size) if st else 0, stamp))
+
+    groups = OrderedDict()
+    for name, size, stamp in files:
+        groups.setdefault(_DIGITS_RE.sub("#", name), []).append((name, size, stamp))
+
+    file_rows = []
+    for pattern, items in groups.items():
+        if len(items) >= COLLAPSE_THRESHOLD:
+            file_rows.append([pattern,
+                              sum(i[1] for i in items),
+                              max(i[2] for i in items),
+                              len(items)])
+        else:
+            for name, size, stamp in items:
+                file_rows.append([name, size, stamp])
+
+    rows = dir_rows + file_rows
+    if limit is not None and len(rows) > limit:
+        hidden = len(rows) - limit
+        rows = rows[:limit]
+        rows.append(["... (%d more entries not listed)" % hidden, None, 0])
     return rows
 
 
@@ -845,13 +886,11 @@ def _find_gamma_file(directory):
 # TREE CONSTRUCTION
 # ===========================================================================
 
-def _new_node(idgen, kind, name, path, root=None):
+def _new_node(kind, name, path):
     return {
-        "id":        idgen(),
         "kind":      kind,
         "name":      str(name),
         "path":      str(path),
-        "rel":       _rel_posix(path, root) if root is not None else "",
         "code":      None,
         "summary":   "",
         "info":      [],
@@ -860,19 +899,18 @@ def _new_node(idgen, kind, name, path, root=None):
         "plots":     [],
         "files":     [],
         "children":  [],
-        "counts":    {"simulations": 0, "models": 0},
     }
 
 
-def _ensure_folder_node(path, root_path, root_node, registry, idgen):
+def _ensure_folder_node(path, root_path, root_node, registry):
     if path == root_path:
         return root_node
     node = registry.get(path)
     if node is not None:
         return node
-    parent = _ensure_folder_node(path.parent, root_path, root_node, registry, idgen)
-    node = _new_node(idgen, "folder", path.name, path, root_path)
-    node["info"] = [["Path", str(path)], ["Last modified", _mtime_str(path)]]
+    parent = _ensure_folder_node(path.parent, root_path, root_node, registry)
+    node = _new_node("folder", path.name, path)
+    node["info"] = [["Last modified", _mtime_str(path)]]
     parent["children"].append(node)
     registry[path] = node
     return node
@@ -899,18 +937,14 @@ def _attach_model_info(node, code, opts):
     node["plots"] = _collect_plots(directory, opts["output_dir"], opts["scan_plots"])
     node["files"] = _list_files(directory, opts["max_files"])
 
-    info = [
-        ["Code", CODE_LABELS.get(code, code)],
-        ["Path", str(directory)],
-        ["Last modified", _mtime_str(directory)],
-    ]
-    if code == "m3dc1" and extra:
+    info = [["Last modified", _mtime_str(directory)]]
+    if extra:
         info.append(["Growth-rate file", extra[0].name])
-    node["info"] = info + node["info"]
+    node["info"] = info + [r for r in node["info"] if r[0] != "Last modified"]
 
 
-def _simulation_node(idgen, mode_dir, code, root_path, opts):
-    node = _new_node(idgen, "simulation", mode_dir.name, mode_dir, root_path)
+def _simulation_node(mode_dir, code, opts):
+    node = _new_node("simulation", mode_dir.name, mode_dir)
     node["code"] = code
 
     docs = _collect_documents(mode_dir, code, opts["max_doc_bytes"])
@@ -923,11 +957,7 @@ def _simulation_node(idgen, mode_dir, code, root_path, opts):
     node["summary"] = summary
     node["physics"] = physics
 
-    info = [
-        ["Code", CODE_LABELS.get(code, code)],
-        ["Path", str(mode_dir)],
-        ["Last modified", _mtime_str(mode_dir)],
-    ]
+    info = [["Last modified", _mtime_str(mode_dir)]]
 
     ntor = _int(params, "ntor") if code == "m3dc1" else None
     if ntor is None:
@@ -966,7 +996,7 @@ def _simulation_node(idgen, mode_dir, code, root_path, opts):
 
 
 def _finalize(node):
-    """Recursively sorts children, aggregates counts and fills derived info."""
+    """Recursively sorts children and counts simulations / models."""
     sims = 0
     models = 0
     for child in node["children"]:
@@ -979,33 +1009,13 @@ def _finalize(node):
     if node["kind"] == "model":
         models += 1
 
-    node["counts"]["simulations"] = sims
-    node["counts"]["models"] = models
     node["children"].sort(key=lambda c: (KIND_ORDER.get(c["kind"], 9),
                                          _natural_key(c["name"])))
-
-    if node["kind"] in ("model", "root") and node["children"]:
-        sim_children = [c for c in node["children"] if c["kind"] == "simulation"]
-        if sim_children:
-            node["info"].append(["Simulations", ", ".join(c["name"] for c in sim_children)])
-        if not node["summary"]:
-            for c in sim_children:
-                if c["summary"]:
-                    node["summary"] = c["summary"]
-                    if not node["physics"]:
-                        node["physics"] = list(c["physics"])
-                    break
-
-    if node["kind"] in ("root", "folder"):
-        node["info"].append(["Simulations below", str(sims)])
-        node["info"].append(["Models below", str(models)])
-
     node.pop("_model_done", None)
     return sims, models
 
 
 def _build_tree(sources, opts):
-    idgen = _IdGen()
     registry = {}
     roots = []
     seen = set()
@@ -1021,9 +1031,8 @@ def _build_tree(sources, opts):
 
         root_node = registry.get(root_path)
         if root_node is None:
-            root_node = _new_node(idgen, "root", str(root_path), root_path, root_path)
-            root_node["info"] = [["Root directory", str(root_path)],
-                                 ["Last modified", _mtime_str(root_path)]]
+            root_node = _new_node("root", str(root_path), root_path)
+            root_node["info"] = [["Last modified", _mtime_str(root_path)]]
             registry[root_path] = root_node
             roots.append(root_node)
 
@@ -1038,21 +1047,115 @@ def _build_tree(sources, opts):
                 model_node = root_node
             else:
                 model_node = _ensure_folder_node(model_path, root_path, root_node,
-                                                 registry, idgen)
+                                                 registry)
             _attach_model_info(model_node, code, opts)
 
-            sim_node = _simulation_node(idgen, mode_dir, code, root_path, opts)
+            sim_node = _simulation_node(mode_dir, code, opts)
             model_node["children"].append(sim_node)
 
             stats["simulations"] += 1
             stats["by_code"][code] = stats["by_code"].get(code, 0) + 1
 
     for root_node in roots:
-        sims, models = _finalize(root_node)
+        _sims, models = _finalize(root_node)
         stats["models"] += models
 
     stats["roots"] = len(roots)
     return roots, stats
+
+
+# ===========================================================================
+# PAYLOAD PACKING
+# ===========================================================================
+
+def _pack_payload(roots, stats, title):
+    """
+    Converts the rich node tree into the compact structure that is embedded in
+    the page (see the module docstring for the rationale).
+    """
+    labels = []
+    label_index = {}
+    texts = []
+    text_index = {}
+    nodes = []
+
+    def label_id(text):
+        key = str(text)
+        idx = label_index.get(key)
+        if idx is None:
+            idx = len(labels)
+            labels.append(key)
+            label_index[key] = idx
+        return idx
+
+    def text_id(text):
+        key = text if isinstance(text, str) else str(text)
+        idx = text_index.get(key)
+        if idx is None:
+            idx = len(texts)
+            texts.append(key)
+            text_index[key] = idx
+        return idx
+
+    def pack_rows(rows):
+        return [[label_id(r[0]), r[1]] for r in rows if r[1] not in (None, "")]
+
+    def pack_doc(doc):
+        entry = [doc["name"], text_id(doc.get("text", "")), int(doc.get("size", 0))]
+        if doc.get("truncated"):
+            entry.append(1)
+        return entry
+
+    def walk(node, parent):
+        index = len(nodes)
+        entry = [
+            parent,
+            KIND_CODES.get(node["kind"], 1),
+            node["path"] if node["kind"] == "root" else node["name"],
+            CODE_ORDER.index(node["code"]) if node.get("code") in CODE_ORDER else 0,
+            node.get("summary") or "",
+            pack_rows(node.get("info") or []),
+            pack_rows(node.get("physics") or []),
+            [pack_doc(d) for d in (node.get("documents") or [])],
+            [[p["name"], p["src"]] for p in (node.get("plots") or [])],
+            node.get("files") or [],
+        ]
+        while len(entry) > 3 and not entry[-1]:
+            entry.pop()
+        nodes.append(entry)
+        for child in node["children"]:
+            walk(child, index)
+
+    for root in roots:
+        walk(root, -1)
+
+    return {
+        "v":           2,
+        "title":       str(title),
+        "generated":   _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "sep":         os.sep,
+        "codes":       CODE_ORDER,
+        "code_labels": CODE_LABELS,
+        "stats":       stats,
+        "labels":      labels,
+        "texts":       texts,
+        "nodes":       nodes,
+    }
+
+
+def _encode_payload(payload, compress):
+    """Returns (embedded_text, encoding_name, raw_bytes, encoded_bytes)."""
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    raw_bytes = len(raw.encode("utf-8"))
+
+    if not compress:
+        safe = raw.replace("<", "\\u003c").replace("&", "\\u0026")
+        return safe, "json", raw_bytes, len(safe.encode("utf-8"))
+
+    blob = gzip.compress(raw.encode("utf-8"), 9)
+    b64 = base64.b64encode(blob).decode("ascii")
+    wrapped = "\n".join(b64[i:i + 120] for i in range(0, len(b64), 120))
+    return wrapped, "gzip+base64", raw_bytes, len(wrapped)
 
 
 # ===========================================================================
@@ -1162,50 +1265,38 @@ pre.raw{background:var(--pre-bg);color:var(--pre-text);padding:12px;border-radiu
 footer{padding:10px 18px;color:var(--muted);font-size:11px;}
 """
 
-_SCRIPT = """
+_SCRIPT = r"""
 (function () {
   "use strict";
 
-  var DATA = JSON.parse(document.getElementById("edges-data").textContent);
-  var INDEX = {}, PARENT = {}, expanded = {}, current = null, activeTab = "Overview";
-
   /* --------------------------------------------------------- dark mode */
+
   var THEME_KEY = "edges-ml-theme";
 
   function applyTheme(theme) {
     document.documentElement.setAttribute("data-theme", theme);
     var btn = document.getElementById("theme-toggle");
-    if (btn) { btn.textContent = theme === "dark" ? "\\u2600\\uFE0F Light" : "\\uD83C\\uDF19 Dark"; }
+    if (btn) { btn.textContent = theme === "dark" ? "\u2600\uFE0F Light" : "\uD83C\uDF19 Dark"; }
   }
 
   function toggleTheme() {
-    var current = document.documentElement.getAttribute("data-theme") || "light";
-    var next = current === "dark" ? "light" : "dark";
+    var cur = document.documentElement.getAttribute("data-theme") || "light";
+    var next = cur === "dark" ? "light" : "dark";
     applyTheme(next);
-    try { localStorage.setItem(THEME_KEY, next); } catch(e) {}
+    try { localStorage.setItem(THEME_KEY, next); } catch (e) {}
   }
 
   (function initTheme() {
     var saved = null;
-    try { saved = localStorage.getItem(THEME_KEY); } catch(e) {}
-    var preferred = saved || (window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+    try { saved = localStorage.getItem(THEME_KEY); } catch (e) {}
+    var preferred = saved || ((window.matchMedia &&
+      window.matchMedia("(prefers-color-scheme: dark)").matches) ? "dark" : "light");
     applyTheme(preferred);
   })();
 
   document.getElementById("theme-toggle").addEventListener("click", toggleTheme);
 
-  /* ---------------------------------------------------------------- index */
-
-  function indexNode(node, parent, depth) {
-    INDEX[node.id] = node;
-    PARENT[node.id] = parent;
-    node._depth = depth;
-    if (expanded[node.id] === undefined) {
-      expanded[node.id] = (node.kind === "root") || (depth <= 1 && node.kind === "folder");
-    }
-    (node.children || []).forEach(function (c) { indexNode(c, node, depth + 1); });
-  }
-  DATA.tree.forEach(function (n) { indexNode(n, null, 0); });
+  /* ------------------------------------------------------------ helpers */
 
   function el(tag, cls, text) {
     var e = document.createElement(tag);
@@ -1214,386 +1305,655 @@ _SCRIPT = """
     return e;
   }
 
-  function codeLabel(code) {
-    return (DATA.code_labels && DATA.code_labels[code]) ? DATA.code_labels[code] : code;
+  function humanSize(n) {
+    if (n === null || n === undefined || n < 0) { return ""; }
+    var units = ["B", "KB", "MB", "GB", "TB"], i = 0, v = Number(n);
+    while (v >= 1024 && i < units.length - 1) { v /= 1024; i += 1; }
+    return (i === 0 ? String(Math.round(v)) : v.toFixed(1)) + " " + units[i];
   }
 
-  function kindLabel(kind) {
-    return {root: "Root directory", folder: "Directory",
-            model: "Model", simulation: "Simulation"}[kind] || kind;
+  function fmtTime(t) {
+    if (!t) { return ""; }
+    var d = new Date(t * 1000);
+    function p(x) { return (x < 10 ? "0" : "") + x; }
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate()) +
+           " " + p(d.getHours()) + ":" + p(d.getMinutes());
   }
 
-  function iconFor(node) {
-    if (node.kind === "simulation") { return "\\u25CF"; }
-    if (node.kind === "model") { return "\\u25A3"; }
-    return "\\u25B0";
+  function message(text, isError) {
+    var host = document.getElementById("detail");
+    host.innerHTML = "";
+    host.appendChild(el("p", isError ? "note" : "muted", text));
   }
 
-  /* ---------------------------------------------------------------- tree */
+  /* ----------------------------------------------- payload (lazy inflate) */
 
-  function query() {
-    return document.getElementById("search").value.trim().toLowerCase();
+  function base64ToBytes(b64) {
+    var bin = atob(String(b64).replace(/\s+/g, ""));
+    var out = new Uint8Array(bin.length);
+    for (var i = 0; i < bin.length; i++) { out[i] = bin.charCodeAt(i); }
+    return out;
   }
 
-  function matches(node, q) {
-    if (!q) { return true; }
-    var hay = ((node.name || "") + " " + (node.rel || "") + " " +
-               (node.path || "") + " " + (node.summary || "")).toLowerCase();
-    return hay.indexOf(q) >= 0;
+  function loadPayload() {
+    var holder = document.getElementById("edges-data");
+    var enc = holder.getAttribute("data-encoding") || "json";
+    if (enc !== "gzip+base64") {
+      return Promise.resolve(JSON.parse(holder.textContent));
+    }
+    if (typeof DecompressionStream === "undefined") {
+      return Promise.reject(new Error(
+        "This browser cannot inflate the embedded data (DecompressionStream is " +
+        "missing). Use a recent Firefox/Chrome/Edge/Safari, or regenerate the " +
+        "page with --no-compress."));
+    }
+    var stream = new Blob([base64ToBytes(holder.textContent)]).stream()
+      .pipeThrough(new DecompressionStream("gzip"));
+    return new Response(stream).text().then(function (txt) { return JSON.parse(txt); });
   }
 
-  function subtreeMatches(node, q) {
-    if (matches(node, q)) { return true; }
-    var kids = node.children || [];
-    for (var i = 0; i < kids.length; i++) {
-      if (subtreeMatches(kids[i], q)) { return true; }
+  /* ------------------------------------------- namelist parser (client) */
+
+  function stripComment(line) {
+    var out = "", quote = null;
+    for (var i = 0; i < line.length; i++) {
+      var ch = line.charAt(i);
+      if (quote !== null) { out += ch; if (ch === quote) { quote = null; } continue; }
+      if (ch === "'" || ch === '"') { quote = ch; out += ch; continue; }
+      if (ch === "!" || ch === "#") { break; }
+      out += ch;
+    }
+    return out;
+  }
+
+  function quoteSpans(line) {
+    var spans = [], quote = null, start = 0;
+    for (var i = 0; i < line.length; i++) {
+      var ch = line.charAt(i);
+      if (quote === null) {
+        if (ch === "'" || ch === '"') { quote = ch; start = i; }
+      } else if (ch === quote) { spans.push([start, i]); quote = null; }
+    }
+    if (quote !== null) { spans.push([start, line.length]); }
+    return spans;
+  }
+
+  function inSpans(pos, spans) {
+    for (var i = 0; i < spans.length; i++) {
+      if (spans[i][0] <= pos && pos <= spans[i][1]) { return true; }
     }
     return false;
   }
 
-  function isOpen(node, q) {
-    if (q) { return true; }
-    return !!expanded[node.id];
+  function cleanValue(value) {
+    var v = String(value).trim().replace(/,+$/, "").trim();
+    if (v.length >= 2 && v.charAt(0) === v.charAt(v.length - 1) &&
+        (v.charAt(0) === "'" || v.charAt(0) === '"')) {
+      v = v.slice(1, -1);
+    }
+    return v.trim();
   }
 
-  function renderTree() {
-    var q = query();
-    var host = document.getElementById("tree");
-    host.innerHTML = "";
-    var ul = el("ul", "tree");
-    DATA.tree.forEach(function (n) {
-      var li = renderNode(n, q);
-      if (li) { ul.appendChild(li); }
-    });
-    if (!ul.childNodes.length) {
-      host.appendChild(el("p", "muted", "No entries match the current filter."));
-      return;
-    }
-    host.appendChild(ul);
-  }
+  var ASSIGN_RE = /([A-Za-z_][A-Za-z0-9_%]*(?:\s*\([^)]*\))?)\s*=\s*/g;
+  var GROUP_RE = /^[&$]([A-Za-z0-9_]*)\s*/;
 
-  function renderNode(node, q) {
-    if (q && !subtreeMatches(node, q)) { return null; }
+  function parseNamelist(text) {
+    var rows = [], index = {}, current = null, last = null;
+    var lines = String(text).split(/\r?\n/);
 
-    var li = el("li");
-    var kids = node.children || [];
-    var row = el("div", "row kind-" + node.kind);
-    if (current === node.id) { row.className += " selected"; }
-
-    var tog = el("span", "toggle", kids.length ? (isOpen(node, q) ? "\\u25BE" : "\\u25B8") : "");
-    tog.addEventListener("click", function (ev) {
-      ev.stopPropagation();
-      if (!kids.length) { return; }
-      expanded[node.id] = !isOpen(node, q);
-      renderTree();
-    });
-    row.appendChild(tog);
-    row.appendChild(el("span", "icon", iconFor(node)));
-
-    var label = el("span", "label", node.kind === "root" ? node.path : node.name);
-    label.title = node.path;
-    row.appendChild(label);
-
-    if (node.kind === "simulation" && node.code) {
-      row.appendChild(el("span", "badge code-" + node.code, codeLabel(node.code)));
-    } else if (node.counts && node.counts.simulations) {
-      row.appendChild(el("span", "count", String(node.counts.simulations)));
+    function put(group, key, value) {
+      var k = group + "\u0000" + key;
+      if (index[k] === undefined) { index[k] = rows.length; rows.push([key, value, group]); }
+      else { rows[index[k]][1] = value; }
+      last = k;
     }
 
-    row.addEventListener("click", function () { select(node.id); });
-    li.appendChild(row);
-
-    if (kids.length && isOpen(node, q)) {
-      var ul = el("ul");
-      kids.forEach(function (c) {
-        var x = renderNode(c, q);
-        if (x) { ul.appendChild(x); }
-      });
-      li.appendChild(ul);
-    }
-    return li;
-  }
-
-  function select(id) {
-    var node = INDEX[id];
-    if (!node) { return; }
-    current = id;
-    var p = PARENT[id];
-    while (p) { expanded[p.id] = true; p = PARENT[p.id]; }
-    renderTree();
-    renderDetail(node);
-    if (window.history && window.history.replaceState) {
-      window.history.replaceState(null, "", "#" + id);
-    }
-    var sel = document.querySelector(".row.selected");
-    if (sel && sel.scrollIntoView) { sel.scrollIntoView({block: "nearest"}); }
-  }
-
-  /* -------------------------------------------------------------- detail */
-
-  function kvTable(rows, headers) {
-    var t = el("table", "kv");
-    if (headers) {
-      var thead = el("thead");
-      var htr = el("tr");
-      headers.forEach(function (h) { htr.appendChild(el("th", null, h)); });
-      thead.appendChild(htr);
-      t.appendChild(thead);
-    }
-    var tb = el("tbody");
-    rows.forEach(function (r) {
-      var tr = el("tr");
-      r.forEach(function (cell, i) {
-        var td = el("td", i === 0 ? null : "v", String(cell === null ? "" : cell));
-        tr.appendChild(td);
-      });
-      tb.appendChild(tr);
-    });
-    t.appendChild(tb);
-    return t;
-  }
-
-  function crumbs(node) {
-    var chain = [], p = node;
-    while (p) { chain.unshift(p); p = PARENT[p.id]; }
-    var box = el("div", "crumbs");
-    chain.forEach(function (n, i) {
-      if (i) { box.appendChild(el("span", "sep", "/")); }
-      var s = el("span", null, n.kind === "root" ? n.path : n.name);
-      s.addEventListener("click", function () { select(n.id); });
-      box.appendChild(s);
-    });
-    return box;
-  }
-
-  function overviewPanel(node) {
-    var panel = el("div", "panel");
-
-    if (node.info && node.info.length) {
-      panel.appendChild(el("h2", "section", "Metadata"));
-      panel.appendChild(kvTable(node.info));
+    function append(extra) {
+      if (last === null || index[last] === undefined || !extra) { return; }
+      var r = rows[index[last]];
+      r[1] = (r[1] + " " + extra).trim();
     }
 
-    if (node.physics && node.physics.length) {
-      panel.appendChild(el("h2", "section", "Physical model"));
-      panel.appendChild(kvTable(node.physics));
-    }
+    for (var li = 0; li < lines.length; li++) {
+      var line = stripComment(lines[li]).trim();
+      if (!line) { continue; }
 
-    var kids = node.children || [];
-    if (kids.length) {
-      panel.appendChild(el("h2", "section", "Contents"));
-      var chips = el("div", "chips");
-      kids.forEach(function (c) {
-        var txt = c.name;
-        if (c.kind !== "simulation" && c.counts && c.counts.simulations) {
-          txt += "  (" + c.counts.simulations + ")";
+      while (line.charAt(0) === "&" || line.charAt(0) === "$") {
+        var gm = GROUP_RE.exec(line);
+        if (!gm) { break; }
+        var gname = gm[1];
+        line = line.slice(gm[0].length).trim();
+        current = (gname === "" || gname.toLowerCase() === "end") ? null : gname;
+        if (!line) { break; }
+      }
+
+      if (!line || line === "/" || line === "&end" || line === "$end") { continue; }
+      if (line.charAt(line.length - 1) === "/") { line = line.slice(0, -1).trim(); }
+      if (!line) { continue; }
+
+      var group = current || "(global)";
+      var spans = quoteSpans(line);
+      var hits = [], m;
+      ASSIGN_RE.lastIndex = 0;
+      while ((m = ASSIGN_RE.exec(line)) !== null) {
+        if (!inSpans(m.index, spans)) {
+          hits.push({start: m.index, end: ASSIGN_RE.lastIndex, key: m[1].trim()});
         }
-        var b = el("button", "chip", txt);
-        b.title = c.summary || c.path;
-        b.addEventListener("click", function () { select(c.id); });
-        chips.appendChild(b);
-      });
-      panel.appendChild(chips);
+      }
+
+      if (!hits.length) { append(line.replace(/,+$/, "").trim()); continue; }
+      if (hits[0].start > 0) {
+        append(line.slice(0, hits[0].start).trim().replace(/,+$/, "").trim());
+      }
+      for (var h = 0; h < hits.length; h++) {
+        var stop = (h + 1 < hits.length) ? hits[h + 1].start : line.length;
+        put(group, hits[h].key,
+            line.slice(hits[h].end, stop).trim().replace(/,+$/, "").trim());
+      }
     }
 
-    if (node.files && node.files.length) {
-      panel.appendChild(el("h2", "section", "Files in this directory"));
-      panel.appendChild(kvTable(node.files, ["Name", "Size", "Modified"]));
-    }
-
-    if (!panel.childNodes.length) {
-      panel.appendChild(el("p", "muted", "Nothing to show."));
-    }
-    return panel;
+    return rows.map(function (r) { return [r[0], cleanValue(r[1]), r[2]]; });
   }
 
-  function inputsPanel(node) {
-    var panel = el("div", "panel");
-    var docs = node.documents || [];
-    if (!docs.length) {
-      panel.appendChild(el("p", "muted",
-        "No input files were found in this directory."));
+  /* ---------------------------------------------------------------- boot */
+
+  message("Loading simulation index\u2026");
+  loadPayload().then(boot, function (err) {
+    message(String((err && err.message) || err), true);
+  });
+
+  function boot(DATA) {
+    var SEP = DATA.sep || "/";
+    var LABELS = DATA.labels || [];
+    var TEXTS = DATA.texts || [];
+    var CODES = DATA.codes || [""];
+    var KINDS = ["root", "folder", "model", "simulation"];
+
+    var NODES = [];
+    (DATA.nodes || []).forEach(function (r, i) {
+      var parent = r[0];
+      var node = {
+        id: i,
+        parent: parent,
+        kind: KINDS[r[1] || 0] || "folder",
+        name: r[2] || "",
+        code: CODES[r[3] || 0] || null,
+        summary: r[4] || "",
+        info: r[5] || [],
+        physics: r[6] || [],
+        docs: r[7] || [],
+        plots: r[8] || [],
+        files: r[9] || [],
+        children: [],
+        sims: 0,
+        models: 0,
+        depth: 0
+      };
+      if (parent >= 0) {
+        node.path = NODES[parent].path + SEP + node.name;
+        node.depth = NODES[parent].depth + 1;
+        NODES[parent].children.push(node);
+      } else {
+        node.path = node.name;
+      }
+      NODES.push(node);
+    });
+
+    for (var i = NODES.length - 1; i >= 0; i--) {
+      var n = NODES[i];
+      if (n.kind === "simulation") { n.sims += 1; }
+      if (n.kind === "model") { n.models += 1; }
+      if (n.parent >= 0) {
+        NODES[n.parent].sims += n.sims;
+        NODES[n.parent].models += n.models;
+      }
+    }
+
+    var ROOTS = NODES.filter(function (x) { return x.parent < 0; });
+    var expanded = {}, current = null, activeTab = "Overview";
+
+    NODES.forEach(function (x) {
+      expanded[x.id] = (x.kind === "root") || (x.depth <= 1 && x.kind === "folder");
+    });
+
+    function parentOf(node) {
+      return node.parent >= 0 ? NODES[node.parent] : null;
+    }
+
+    function codeLabel(code) {
+      return (DATA.code_labels && DATA.code_labels[code]) ? DATA.code_labels[code] : code;
+    }
+
+    function kindLabel(kind) {
+      return {root: "Root directory", folder: "Directory",
+              model: "Model", simulation: "Simulation"}[kind] || kind;
+    }
+
+    function iconFor(node) {
+      if (node.kind === "simulation") { return "\u25CF"; }
+      if (node.kind === "model") { return "\u25A3"; }
+      return "\u25B0";
+    }
+
+    /* a model/folder inherits the description of its first simulation */
+    function reference(node) {
+      if (node._ref !== undefined) { return node._ref; }
+      var found = null;
+      if (node.kind === "simulation") {
+        found = node;
+      } else {
+        for (var k = 0; k < node.children.length; k++) {
+          var cand = reference(node.children[k]);
+          if (cand && (cand.summary || cand.physics.length)) { found = cand; break; }
+        }
+      }
+      node._ref = found;
+      return found;
+    }
+
+    function summaryOf(node) {
+      if (node.summary) { return node.summary; }
+      var ref = reference(node);
+      return ref ? ref.summary : "";
+    }
+
+    /* ---------------------------------------------------------- tree */
+
+    function query() {
+      return document.getElementById("search").value.trim().toLowerCase();
+    }
+
+    function matches(node, q) {
+      if (!q) { return true; }
+      if (node._hay === undefined) {
+        node._hay = (node.name + " " + node.path + " " + summaryOf(node)).toLowerCase();
+      }
+      return node._hay.indexOf(q) >= 0;
+    }
+
+    function subtreeMatches(node, q) {
+      if (matches(node, q)) { return true; }
+      for (var k = 0; k < node.children.length; k++) {
+        if (subtreeMatches(node.children[k], q)) { return true; }
+      }
+      return false;
+    }
+
+    function isOpen(node, q) {
+      return q ? true : !!expanded[node.id];
+    }
+
+    function renderTree() {
+      var q = query();
+      var host = document.getElementById("tree");
+      host.innerHTML = "";
+      var ul = el("ul", "tree");
+      ROOTS.forEach(function (node) {
+        var li = renderNode(node, q);
+        if (li) { ul.appendChild(li); }
+      });
+      if (!ul.childNodes.length) {
+        host.appendChild(el("p", "muted", "No entries match the current filter."));
+        return;
+      }
+      host.appendChild(ul);
+    }
+
+    function renderNode(node, q) {
+      if (q && !subtreeMatches(node, q)) { return null; }
+
+      var li = el("li");
+      var kids = node.children;
+      var row = el("div", "row kind-" + node.kind);
+      if (current === node.id) { row.className += " selected"; }
+
+      var tog = el("span", "toggle", kids.length ? (isOpen(node, q) ? "\u25BE" : "\u25B8") : "");
+      tog.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        if (!kids.length) { return; }
+        expanded[node.id] = !isOpen(node, q);
+        renderTree();
+      });
+      row.appendChild(tog);
+      row.appendChild(el("span", "icon", iconFor(node)));
+
+      var label = el("span", "label", node.name);
+      label.title = node.path;
+      row.appendChild(label);
+
+      if (node.kind === "simulation" && node.code) {
+        row.appendChild(el("span", "badge code-" + node.code, codeLabel(node.code)));
+      } else if (node.sims) {
+        row.appendChild(el("span", "count", String(node.sims)));
+      }
+
+      row.addEventListener("click", function () { select(node.id); });
+      li.appendChild(row);
+
+      if (kids.length && isOpen(node, q)) {
+        var ul = el("ul");
+        kids.forEach(function (c) {
+          var x = renderNode(c, q);
+          if (x) { ul.appendChild(x); }
+        });
+        li.appendChild(ul);
+      }
+      return li;
+    }
+
+    function select(id) {
+      var node = NODES[id];
+      if (!node) { return; }
+      current = id;
+      var p = parentOf(node);
+      while (p) { expanded[p.id] = true; p = parentOf(p); }
+      renderTree();
+      renderDetail(node);
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState(null, "", "#n" + id);
+      }
+      var sel = document.querySelector(".row.selected");
+      if (sel && sel.scrollIntoView) { sel.scrollIntoView({block: "nearest"}); }
+    }
+
+    /* -------------------------------------------------------- detail */
+
+    function kvTable(rows, headers) {
+      var t = el("table", "kv");
+      if (headers) {
+        var thead = el("thead"), htr = el("tr");
+        headers.forEach(function (h) { htr.appendChild(el("th", null, h)); });
+        thead.appendChild(htr);
+        t.appendChild(thead);
+      }
+      var tb = el("tbody");
+      rows.forEach(function (r) {
+        var tr = el("tr");
+        r.forEach(function (cell, i) {
+          tr.appendChild(el("td", i === 0 ? null : "v",
+                            String(cell === null || cell === undefined ? "" : cell)));
+        });
+        tb.appendChild(tr);
+      });
+      t.appendChild(tb);
+      return t;
+    }
+
+    function crumbs(node) {
+      var chain = [], p = node;
+      while (p) { chain.unshift(p); p = parentOf(p); }
+      var box = el("div", "crumbs");
+      chain.forEach(function (x, i) {
+        if (i) { box.appendChild(el("span", "sep", "/")); }
+        var s = el("span", null, x.name);
+        s.addEventListener("click", function () { select(x.id); });
+        box.appendChild(s);
+      });
+      return box;
+    }
+
+    function infoRows(node) {
+      var rows = [];
+      if (node.code) { rows.push(["Code", codeLabel(node.code)]); }
+      rows.push([node.kind === "root" ? "Root directory" : "Path", node.path]);
+      node.info.forEach(function (r) { rows.push([LABELS[r[0]] || "", r[1]]); });
+      if (node.kind !== "simulation") {
+        rows.push(["Simulations below", String(node.sims)]);
+        if (node.models) { rows.push(["Models below", String(node.models)]); }
+      }
+      return rows;
+    }
+
+    function fileRows(node) {
+      return node.files.map(function (f) {
+        var size = f[1], count = f[3], text;
+        if (count) { text = count + " files, " + humanSize(size); }
+        else if (size === null || size === undefined) { text = ""; }
+        else if (size < 0) { text = "directory"; }
+        else { text = humanSize(size); }
+        return [f[0], text, fmtTime(f[2])];
+      });
+    }
+
+    function overviewPanel(node) {
+      var panel = el("div", "panel");
+
+      panel.appendChild(el("h2", "section", "Metadata"));
+      panel.appendChild(kvTable(infoRows(node)));
+
+      var phys = node.physics, from = null;
+      if (!phys.length) {
+        var ref = reference(node);
+        if (ref && ref.physics.length) { phys = ref.physics; from = ref; }
+      }
+      if (phys.length) {
+        panel.appendChild(el("h2", "section",
+          from ? ("Physical model (from " + from.name + ")") : "Physical model"));
+        panel.appendChild(kvTable(phys.map(function (r) {
+          return [LABELS[r[0]] || "", r[1]];
+        })));
+      }
+
+      if (node.children.length) {
+        panel.appendChild(el("h2", "section", "Contents"));
+        var chips = el("div", "chips");
+        node.children.forEach(function (c) {
+          var txt = c.name;
+          if (c.kind !== "simulation" && c.sims) { txt += "  (" + c.sims + ")"; }
+          var b = el("button", "chip", txt);
+          b.title = summaryOf(c) || c.path;
+          b.addEventListener("click", function () { select(c.id); });
+          chips.appendChild(b);
+        });
+        panel.appendChild(chips);
+      }
+
+      if (node.files.length) {
+        panel.appendChild(el("h2", "section", "Files in this directory"));
+        panel.appendChild(kvTable(fileRows(node), ["Name", "Size", "Modified"]));
+      }
       return panel;
     }
 
-    var state = {idx: 0, raw: false, filter: ""};
+    function docParams(d) {
+      if (d._p === undefined) {
+        d._p = /^readme/i.test(d[0]) ? [] : parseNamelist(TEXTS[d[1]] || "");
+      }
+      return d._p;
+    }
 
-    function draw() {
-      panel.innerHTML = "";
+    function inputsPanel(node) {
+      var panel = el("div", "panel");
+      var docs = node.docs;
+      if (!docs.length) {
+        panel.appendChild(el("p", "muted",
+          "No input files were found in this directory."));
+        return panel;
+      }
 
-      var bar = el("div", "docbar");
-      docs.forEach(function (d, i) {
-        var b = el("button", "doctab" + (i === state.idx ? " active" : ""), d.name);
-        b.title = d.path;
-        b.addEventListener("click", function () { state.idx = i; draw(); });
-        bar.appendChild(b);
-      });
-      panel.appendChild(bar);
+      var state = {idx: 0, raw: false, filter: ""};
 
-      var doc = docs[state.idx];
+      function draw() {
+        panel.innerHTML = "";
 
-      var head = el("p", "muted");
-      head.textContent = doc.path + "  \\u2022  " + doc.size +
-        (doc.truncated ? "  \\u2022  (display truncated)" : "");
-      panel.appendChild(head);
+        var bar = el("div", "docbar");
+        docs.forEach(function (d, i) {
+          var b = el("button", "doctab" + (i === state.idx ? " active" : ""), d[0]);
+          b.title = node.path + SEP + d[0];
+          b.addEventListener("click", function () {
+            state.idx = i; state.filter = ""; draw();
+          });
+          bar.appendChild(b);
+        });
+        panel.appendChild(bar);
 
-      var toggle = el("button", "chip",
-        state.raw ? "Show parsed parameters" : "Show raw file");
-      toggle.addEventListener("click", function () { state.raw = !state.raw; draw(); });
-      panel.appendChild(toggle);
+        var doc = docs[state.idx];
+        var text = TEXTS[doc[1]] || "";
 
-      if (state.raw || !doc.params || !doc.params.length) {
-        var pre = el("pre", "raw", doc.text || "");
-        panel.appendChild(pre);
-        if (!state.raw && (!doc.params || !doc.params.length)) {
-          panel.insertBefore(el("p", "muted",
-            "No key = value assignments were detected; showing the raw file."), pre);
+        panel.appendChild(el("p", "muted",
+          node.path + SEP + doc[0] + "  \u2022  " + humanSize(doc[2] || 0) +
+          (doc[3] ? "  \u2022  (display truncated)" : "")));
+
+        var toggle = el("button", "chip",
+          state.raw ? "Show parsed parameters" : "Show raw file");
+        toggle.addEventListener("click", function () { state.raw = !state.raw; draw(); });
+        panel.appendChild(toggle);
+
+        var params = state.raw ? [] : docParams(doc);
+
+        if (state.raw || !params.length) {
+          var pre = el("pre", "raw", text);
+          panel.appendChild(pre);
+          if (!state.raw && !params.length) {
+            panel.insertBefore(el("p", "muted",
+              "No key = value assignments were detected; showing the raw file."), pre);
+          }
+          return;
         }
+
+        var filt = el("input", "filter");
+        filt.type = "search";
+        filt.placeholder = "Filter parameters\u2026";
+        filt.value = state.filter;
+        filt.addEventListener("input", function () {
+          state.filter = filt.value.toLowerCase();
+          drawTable();
+        });
+        panel.appendChild(filt);
+
+        var holder = el("div");
+        panel.appendChild(holder);
+
+        function drawTable() {
+          holder.innerHTML = "";
+          var rows = params.filter(function (r) {
+            if (!state.filter) { return true; }
+            return (r[0] + " " + r[1] + " " + r[2]).toLowerCase()
+                     .indexOf(state.filter) >= 0;
+          });
+          if (!rows.length) {
+            holder.appendChild(el("p", "muted", "No parameter matches the filter."));
+            return;
+          }
+          holder.appendChild(kvTable(rows, ["Parameter", "Value", "Namelist group"]));
+        }
+        drawTable();
+      }
+
+      draw();
+      return panel;
+    }
+
+    function plotsPanel(node) {
+      var panel = el("div", "panel");
+      if (!node.plots.length) {
+        var note = el("div", "note");
+        note.textContent = "No plots are attached to this entry yet. " +
+          "Plot support is prepared: regenerate the browser with --scan-plots once " +
+          "figures (png/svg/jpg) have been placed in the simulation directory or in " +
+          "a 'plots/' subdirectory.";
+        panel.appendChild(note);
+        return panel;
+      }
+      var gal = el("div", "gallery");
+      node.plots.forEach(function (p) {
+        var name = p[0], src = p[1];
+        var fig = el("figure");
+        if (/\.pdf$/i.test(src)) {
+          var a = el("a", null, name);
+          a.href = src;
+          a.target = "_blank";
+          fig.appendChild(a);
+        } else {
+          var img = document.createElement("img");
+          img.src = src;
+          img.alt = name;
+          img.loading = "lazy";
+          var link = document.createElement("a");
+          link.href = src;
+          link.target = "_blank";
+          link.appendChild(img);
+          fig.appendChild(link);
+        }
+        fig.appendChild(el("figcaption", null, name));
+        gal.appendChild(fig);
+      });
+      panel.appendChild(gal);
+      return panel;
+    }
+
+    function renderDetail(node) {
+      var host = document.getElementById("detail");
+      host.innerHTML = "";
+      if (!node) {
+        host.appendChild(el("p", "muted", "Select an entry in the tree."));
         return;
       }
 
-      var filt = el("input", "filter");
-      filt.type = "search";
-      filt.placeholder = "Filter parameters...";
-      filt.value = state.filter;
-      filt.addEventListener("input", function () {
-        state.filter = filt.value.toLowerCase();
-        drawTable();
+      var head = el("div", "detail-head");
+      head.appendChild(crumbs(node));
+      head.appendChild(el("h1", null, node.name));
+
+      var badges = el("div", "badges");
+      badges.appendChild(el("span", "badge", kindLabel(node.kind)));
+      if (node.code) {
+        badges.appendChild(el("span", "badge code-" + node.code, codeLabel(node.code)));
+      }
+      if (node.sims && node.kind !== "simulation") {
+        badges.appendChild(el("span", "badge",
+          node.sims + " simulation" + (node.sims === 1 ? "" : "s")));
+      }
+      head.appendChild(badges);
+
+      var sum = summaryOf(node);
+      if (sum) { head.appendChild(el("p", "summary", sum)); }
+      head.appendChild(el("p", "path", node.path));
+      host.appendChild(head);
+
+      var names = ["Overview", "Inputs", "Plots"];
+      var counts = {
+        "Overview": "",
+        "Inputs": node.docs.length ? " (" + node.docs.length + ")" : "",
+        "Plots": node.plots.length ? " (" + node.plots.length + ")" : ""
+      };
+      if (names.indexOf(activeTab) < 0) { activeTab = "Overview"; }
+
+      var tabs = el("div", "tabs");
+      names.forEach(function (nm) {
+        var b = el("button", nm === activeTab ? "active" : null, nm + counts[nm]);
+        b.addEventListener("click", function () { activeTab = nm; renderDetail(node); });
+        tabs.appendChild(b);
       });
-      panel.appendChild(filt);
+      host.appendChild(tabs);
 
-      var holder = el("div");
-      panel.appendChild(holder);
-
-      function drawTable() {
-        holder.innerHTML = "";
-        var rows = doc.params.filter(function (r) {
-          if (!state.filter) { return true; }
-          return (r[1] + " " + r[2] + " " + r[0]).toLowerCase().indexOf(state.filter) >= 0;
-        }).map(function (r) { return [r[1], r[2], r[0]]; });
-        if (!rows.length) {
-          holder.appendChild(el("p", "muted", "No parameter matches the filter."));
-          return;
-        }
-        holder.appendChild(kvTable(rows, ["Parameter", "Value", "Namelist group"]));
-      }
-      drawTable();
+      if (activeTab === "Inputs") { host.appendChild(inputsPanel(node)); }
+      else if (activeTab === "Plots") { host.appendChild(plotsPanel(node)); }
+      else { host.appendChild(overviewPanel(node)); }
     }
 
-    draw();
-    return panel;
-  }
+    /* ------------------------------------------------------ controls */
 
-  function plotsPanel(node) {
-    var panel = el("div", "panel");
-    var plots = node.plots || [];
-    if (!plots.length) {
-      var note = el("div", "note");
-      note.textContent = "No plots are attached to this entry yet. " +
-        "Plot support is prepared: regenerate the browser with --scan-plots once " +
-        "figures (png/svg/jpg) have been placed in the simulation directory or in " +
-        "a 'plots/' subdirectory.";
-      panel.appendChild(note);
-      return panel;
+    function setAll(flag) {
+      NODES.forEach(function (x) { expanded[x.id] = flag; });
+      renderTree();
     }
-    var gal = el("div", "gallery");
-    plots.forEach(function (p) {
-      var fig = el("figure");
-      if (/\\.pdf$/i.test(p.src)) {
-        var a = el("a", null, p.name);
-        a.href = p.src;
-        a.target = "_blank";
-        fig.appendChild(a);
-      } else {
-        var img = document.createElement("img");
-        img.src = p.src;
-        img.alt = p.name;
-        img.loading = "lazy";
-        var link = document.createElement("a");
-        link.href = p.src;
-        link.target = "_blank";
-        link.appendChild(img);
-        fig.appendChild(link);
-      }
-      fig.appendChild(el("figcaption", null, p.name));
-      gal.appendChild(fig);
+
+    document.getElementById("search").addEventListener("input", renderTree);
+    document.getElementById("expand-all").addEventListener("click", function () {
+      setAll(true);
     });
-    panel.appendChild(gal);
-    return panel;
-  }
-
-  function renderDetail(node) {
-    var host = document.getElementById("detail");
-    host.innerHTML = "";
-    if (!node) {
-      host.appendChild(el("p", "muted", "Select an entry in the tree."));
-      return;
-    }
-
-    var head = el("div", "detail-head");
-    head.appendChild(crumbs(node));
-    head.appendChild(el("h1", null, node.kind === "root" ? node.path : node.name));
-
-    var badges = el("div", "badges");
-    badges.appendChild(el("span", "badge", kindLabel(node.kind)));
-    if (node.code) {
-      badges.appendChild(el("span", "badge code-" + node.code, codeLabel(node.code)));
-    }
-    if (node.counts && node.counts.simulations && node.kind !== "simulation") {
-      badges.appendChild(el("span", "badge",
-        node.counts.simulations + " simulation" +
-        (node.counts.simulations === 1 ? "" : "s")));
-    }
-    head.appendChild(badges);
-
-    if (node.summary) { head.appendChild(el("p", "summary", node.summary)); }
-    head.appendChild(el("p", "path", node.path));
-    host.appendChild(head);
-
-    var names = ["Overview", "Inputs", "Plots"];
-    var counts = {
-      "Overview": "",
-      "Inputs": (node.documents || []).length ? " (" + node.documents.length + ")" : "",
-      "Plots": (node.plots || []).length ? " (" + node.plots.length + ")" : ""
-    };
-    if (names.indexOf(activeTab) < 0) { activeTab = "Overview"; }
-
-    var tabs = el("div", "tabs");
-    names.forEach(function (n) {
-      var b = el("button", n === activeTab ? "active" : null, n + counts[n]);
-      b.addEventListener("click", function () { activeTab = n; renderDetail(node); });
-      tabs.appendChild(b);
+    document.getElementById("collapse-all").addEventListener("click", function () {
+      setAll(false);
+      ROOTS.forEach(function (x) { expanded[x.id] = true; });
+      renderTree();
     });
-    host.appendChild(tabs);
 
-    if (activeTab === "Inputs") { host.appendChild(inputsPanel(node)); }
-    else if (activeTab === "Plots") { host.appendChild(plotsPanel(node)); }
-    else { host.appendChild(overviewPanel(node)); }
-  }
-
-  /* ----------------------------------------------------------- controls */
-
-  function setAll(flag) {
-    Object.keys(INDEX).forEach(function (id) { expanded[id] = flag; });
     renderTree();
-  }
-
-  document.getElementById("search").addEventListener("input", renderTree);
-  document.getElementById("expand-all").addEventListener("click", function () { setAll(true); });
-  document.getElementById("collapse-all").addEventListener("click", function () {
-    setAll(false);
-    DATA.tree.forEach(function (n) { expanded[n.id] = true; });
-    renderTree();
-  });
-
-  renderTree();
-  var initial = (window.location.hash || "").replace("#", "");
-  if (initial && INDEX[initial]) {
-    select(initial);
-  } else if (DATA.tree.length) {
-    select(DATA.tree[0].id);
-  } else {
-    renderDetail(null);
+    var hash = (window.location.hash || "").replace("#n", "");
+    var start = parseInt(hash, 10);
+    if (!isNaN(start) && NODES[start]) { select(start); }
+    else if (NODES.length) { select(0); }
+    else { renderDetail(null); }
   }
 })();
 """
@@ -1621,7 +1981,7 @@ _PAGE = Template("""<!DOCTYPE html>
   <main id="detail"></main>
 </div>
 <footer>Generated by edges-ml on $generated &mdash; re-run the generator after adding new data.</footer>
-<script id="edges-data" type="application/json">$data</script>
+<script id="edges-data" type="application/octet-stream" data-encoding="$encoding">$data</script>
 <script>$script</script>
 </body>
 </html>
@@ -1637,16 +1997,17 @@ def _stats_line(stats):
     return "  \u2022  ".join(bits)
 
 
-def render_html(data, title):
-    payload = json.dumps(data, ensure_ascii=False)
-    payload = payload.replace("<", "\\u003c").replace("&", "\\u0026")
+def render_html(payload, title, compress=True):
+    """Renders the complete self-contained page for a packed *payload*."""
+    text, encoding, _raw_bytes, _enc_bytes = _encode_payload(payload, compress)
     return _PAGE.safe_substitute(
         title=_html.escape(str(title)),
         style=_STYLE,
         script=_SCRIPT,
-        stats=_html.escape(_stats_line(data["stats"])),
-        generated=_html.escape(data["generated"]),
-        data=payload,
+        stats=_html.escape(_stats_line(payload["stats"])),
+        generated=_html.escape(payload["generated"]),
+        encoding=encoding,
+        data=text,
     )
 
 
@@ -1661,6 +2022,7 @@ def build_browser(sources,
                   max_doc_bytes=DEFAULT_MAX_DOC_BYTES,
                   max_files=DEFAULT_MAX_FILES,
                   json_output=None,
+                  compress=True,
                   quiet=False):
     """
     Crawls *sources* and writes a self-contained HTML browser to *output*.
@@ -1679,9 +2041,13 @@ def build_browser(sources,
     max_doc_bytes : int
         Maximum number of characters shown per input file.
     max_files : int
-        Maximum number of entries shown in the per-directory file listing.
+        Maximum number of entries shown in the per-directory file listing
+        (0 disables the listing completely).
     json_output : str or Path or None
-        Optional path for dumping the raw data model as JSON.
+        Optional path for dumping the embedded (packed) data model as JSON.
+    compress : bool
+        Embed the data gzip+base64 encoded (default).  Set to False to embed
+        plain JSON, e.g. for browsers without ``DecompressionStream``.
 
     Returns
     -------
@@ -1701,26 +2067,27 @@ def build_browser(sources,
     }
 
     tree, stats = _build_tree(sources, opts)
+    payload = _pack_payload(tree, stats, title)
+    _text, encoding, raw_bytes, enc_bytes = _encode_payload(payload, compress)
 
-    data = {
-        "title":       str(title),
-        "generated":   _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "code_labels": CODE_LABELS,
-        "stats":       stats,
-        "tree":        tree,
-    }
-
-    output.write_text(render_html(data, title), encoding="utf-8")
+    output.write_text(render_html(payload, title, compress=compress), encoding="utf-8")
 
     if json_output:
         jpath = Path(json_output).expanduser()
         if jpath.parent and str(jpath.parent) not in ("", "."):
             jpath.parent.mkdir(parents=True, exist_ok=True)
-        jpath.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        jpath.write_text(json.dumps(payload, indent=1, ensure_ascii=False),
+                         encoding="utf-8")
 
     if not quiet:
         print("edges-ml browser: %s" % _stats_line(stats))
-        print("Wrote %s" % output.resolve())
+        print("Payload: %s packed JSON -> %s embedded (%s)"
+              % (_human_size(raw_bytes), _human_size(enc_bytes), encoding))
+        try:
+            print("Wrote %s (%s)" % (output.resolve(),
+                                     _human_size(output.stat().st_size)))
+        except OSError:
+            print("Wrote %s" % output.resolve())
         if json_output:
             print("Wrote %s" % Path(json_output).resolve())
         if not stats["simulations"]:
@@ -1761,10 +2128,13 @@ def main(argv=None):
                         help="Maximum characters embedded per input file "
                              "(default: %d)." % DEFAULT_MAX_DOC_BYTES)
     parser.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES,
-                        help="Maximum entries in the per-directory file listing "
-                             "(default: %d)." % DEFAULT_MAX_FILES)
+                        help="Maximum entries in the per-directory file listing, "
+                             "0 disables it (default: %d)." % DEFAULT_MAX_FILES)
+    parser.add_argument("--no-compress", dest="compress", action="store_false",
+                        help="Embed plain JSON instead of gzip+base64 (bigger "
+                             "file, but works without DecompressionStream).")
     parser.add_argument("--json", dest="json_output", default=None, metavar="FILE",
-                        help="Also dump the collected data model as JSON.")
+                        help="Also dump the embedded (packed) data model as JSON.")
     parser.add_argument("--open", dest="open_browser", action="store_true",
                         help="Open the generated page in a web browser.")
     parser.add_argument("-q", "--quiet", action="store_true",
@@ -1792,6 +2162,7 @@ def main(argv=None):
         max_doc_bytes=args.max_doc_bytes,
         max_files=args.max_files,
         json_output=args.json_output,
+        compress=args.compress,
         quiet=args.quiet,
     )
 

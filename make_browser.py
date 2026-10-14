@@ -8,6 +8,10 @@ namelists, works out which physical model each simulation uses, and writes a
 single self-contained HTML file that can be opened directly in a browser (or
 copied to a web server).
 
+The embedded data is packed and gzip-compressed, and the namelists are only
+parsed in the browser when you actually open them, so the page stays small and
+responsive even for large databases.
+
 Examples
 --------
     # Crawl one root directory for both M3D-C1 and NIMROD runs:
@@ -19,6 +23,12 @@ Examples
 
     # Also link figures that already exist next to the simulations:
     python make_browser.py /scratch/mastu_runs --scan-plots
+
+    # Smaller page: no per-directory file listings, shorter input previews:
+    python make_browser.py /scratch/mastu_runs --max-files 0 --max-doc-bytes 32768
+
+    # Plain (uncompressed) payload for very old browsers:
+    python make_browser.py /scratch/mastu_runs --no-compress
 
 Run 'python make_browser.py --help' for the full list of options.
 """
