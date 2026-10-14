@@ -7,14 +7,15 @@ post-processing stack (fpy, nimpy, h5py, imas, ...).
 
 It crawls the same directory layout that `edges_ml.build_dataset` expects:
 
-    M3D-C1 :  <...>/<model_dir>/<mode_dir>/C1.h5
-    NIMROD :  <...>/<model_dir>/<mode_dir>/nimhist.bin  (+ nimrod.in)
+    M3D-C1 :  <...>/<case_dir>/<mode_dir>/C1.h5
+    NIMROD :  <...>/<case_dir>/<mode_dir>/nimhist.bin  (+ nimrod.in)
 
 and produces a single, self-contained HTML file that lets a user browse the
-directory tree, inspect the physics model of every simulation, and read the
-code input namelists.  A "Plots" tab is already present; it stays empty (with
-a placeholder note) unless image files are discovered (``--scan-plots``), so
-that plotting can be added later without touching the HTML template.
+directory tree, inspect the physics model of every simulation, read the code
+input namelists and look at the M3D-C1 growth-rate tables.  A "Plots" tab is
+already present; it stays empty (with a placeholder note) unless image files
+are discovered (``--scan-plots``), so that plotting can be added later without
+touching the HTML template.
 
 Keeping the page small
 ----------------------
@@ -692,8 +693,9 @@ def _normalize_sources(sources):
 
 def _read_document(path, max_bytes):
     """
-    Reads one input file.  Only the raw text is kept - the parameter table is
-    produced in the browser, which keeps the embedded payload small.
+    Reads one text file.  Only the raw text is kept - parameter tables and
+    growth-rate tables are produced in the browser, which keeps the embedded
+    payload small.
     """
     try:
         size = path.stat().st_size
@@ -721,13 +723,19 @@ def _read_document(path, max_bytes):
     }
 
 
-def _collect_documents(directory, code, max_bytes, extra_files=()):
-    """Collects the input/namelist files of a directory (primary input first)."""
+def _collect_documents(directory, code, max_bytes, exclude=()):
+    """
+    Collects the *input* files of a directory (primary input first).
+
+    Output files such as the M3D-C1 growth-rate table are handled separately
+    and can be suppressed here via *exclude* (a set of file names).
+    """
+    skip = set(str(n) for n in exclude)
     found = OrderedDict()
 
     for name in PRIMARY_INPUT.get(code, []):
         p = directory / name
-        if p.is_file():
+        if p.is_file() and p.name not in skip:
             found[p.name] = p
 
     for pattern in DOC_PATTERNS.get(code, ["*.in", "README*"]):
@@ -736,15 +744,10 @@ def _collect_documents(directory, code, max_bytes, extra_files=()):
         except OSError:
             hits = []
         for p in hits:
-            if not p.is_file():
+            if not p.is_file() or p.name in skip:
                 continue
             if p.suffix.lower() in SKIP_DOC_SUFFIXES:
                 continue
-            found.setdefault(p.name, p)
-
-    for p in extra_files:
-        p = Path(p)
-        if p.is_file():
             found.setdefault(p.name, p)
 
     docs = []
@@ -753,6 +756,17 @@ def _collect_documents(directory, code, max_bytes, extra_files=()):
         if doc is not None:
             docs.append(doc)
     return docs
+
+
+def _collect_growth_rates(directory, code, max_bytes):
+    """Collects the growth-rate table(s) of a directory (M3D-C1 only)."""
+    if code != "m3dc1":
+        return []
+    gamma = _find_gamma_file(directory)
+    if gamma is None:
+        return []
+    doc = _read_document(gamma, max_bytes)
+    return [doc] if doc is not None else []
 
 
 def _primary_params(code, documents):
@@ -896,6 +910,7 @@ def _new_node(kind, name, path):
         "info":      [],
         "physics":   [],
         "documents": [],
+        "gamma":     [],
         "plots":     [],
         "files":     [],
         "children":  [],
@@ -917,7 +932,7 @@ def _ensure_folder_node(path, root_path, root_node, registry):
 
 
 def _attach_model_info(node, code, opts):
-    """Turns a folder node into a model node and attaches its own input files."""
+    """Turns a folder node into a case node and attaches its own files."""
     if node.get("_model_done"):
         return
     node["_model_done"] = True
@@ -926,20 +941,18 @@ def _attach_model_info(node, code, opts):
     node["code"] = node.get("code") or code
 
     directory = Path(node["path"])
-    extra = []
-    if code == "m3dc1":
-        gamma = _find_gamma_file(directory)
-        if gamma is not None:
-            extra.append(gamma)
+
+    gamma_docs = _collect_growth_rates(directory, code, opts["max_doc_bytes"])
+    node["gamma"] = gamma_docs
 
     node["documents"] = _collect_documents(directory, code, opts["max_doc_bytes"],
-                                           extra_files=extra)
+                                           exclude=[d["name"] for d in gamma_docs])
     node["plots"] = _collect_plots(directory, opts["output_dir"], opts["scan_plots"])
     node["files"] = _list_files(directory, opts["max_files"])
 
     info = [["Last modified", _mtime_str(directory)]]
-    if extra:
-        info.append(["Growth-rate file", extra[0].name])
+    if gamma_docs:
+        info.append(["Growth-rate file", gamma_docs[0]["name"]])
     node["info"] = info + [r for r in node["info"] if r[0] != "Last modified"]
 
 
@@ -947,7 +960,11 @@ def _simulation_node(mode_dir, code, opts):
     node = _new_node("simulation", mode_dir.name, mode_dir)
     node["code"] = code
 
-    docs = _collect_documents(mode_dir, code, opts["max_doc_bytes"])
+    gamma_docs = _collect_growth_rates(mode_dir, code, opts["max_doc_bytes"])
+    node["gamma"] = gamma_docs
+
+    docs = _collect_documents(mode_dir, code, opts["max_doc_bytes"],
+                              exclude=[d["name"] for d in gamma_docs])
     node["documents"] = docs
     node["plots"] = _collect_plots(mode_dir, opts["output_dir"], opts["scan_plots"])
     node["files"] = _list_files(mode_dir, opts["max_files"])
@@ -967,6 +984,8 @@ def _simulation_node(mode_dir, code, opts):
 
     if primary_name:
         info.append(["Primary input file", primary_name])
+    if gamma_docs:
+        info.append(["Growth-rate file", gamma_docs[0]["name"]])
 
     marker = SIM_MARKERS.get(code)
     if marker:
@@ -996,7 +1015,7 @@ def _simulation_node(mode_dir, code, opts):
 
 
 def _finalize(node):
-    """Recursively sorts children and counts simulations / models."""
+    """Recursively sorts children and counts simulations / cases."""
     sims = 0
     models = 0
     for child in node["children"]:
@@ -1119,6 +1138,7 @@ def _pack_payload(roots, stats, title):
             [pack_doc(d) for d in (node.get("documents") or [])],
             [[p["name"], p["src"]] for p in (node.get("plots") or [])],
             node.get("files") or [],
+            [pack_doc(d) for d in (node.get("gamma") or [])],
         ]
         while len(entry) > 3 and not entry[-1]:
             entry.pop()
@@ -1130,7 +1150,7 @@ def _pack_payload(roots, stats, title):
         walk(root, -1)
 
     return {
-        "v":           2,
+        "v":           3,
         "title":       str(title),
         "generated":   _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "sep":         os.sep,
@@ -1169,7 +1189,7 @@ _STYLE = """
   --header-bg:#ffffff; --sidebar-bg:#ffffff; --input-bg:#ffffff;
   --chip-bg:#ffffff; --doctab-bg:#ffffff; --pre-bg:#0f172a; --pre-text:#e2e8f0;
   --note-bg:#fff8e1; --note-border:#f0d99b; --note-text:#7a5b00;
-  --gallery-bg:#ffffff;
+  --gallery-bg:#ffffff; --hover:rgba(31,111,235,.14);
 }
 [data-theme="dark"]{
   --bg:#1e2128; --panel:#262b35; --line:#3a4050; --text:#d4d8e0; --muted:#8b95a8;
@@ -1177,7 +1197,7 @@ _STYLE = """
   --header-bg:#262b35; --sidebar-bg:#262b35; --input-bg:#2e3340;
   --chip-bg:#2e3340; --doctab-bg:#2e3340; --pre-bg:#0d1117; --pre-text:#e2e8f0;
   --note-bg:#2e2a1a; --note-border:#6b5a1e; --note-text:#e0c97a;
-  --gallery-bg:#2e3340;
+  --gallery-bg:#2e3340; --hover:rgba(255,255,255,.18);
 }
 *{box-sizing:border-box;}
 html,body{height:100%;margin:0;}
@@ -1201,15 +1221,21 @@ header button:hover{background:var(--accent-soft);border-color:var(--accent);}
 #detail{flex:1;overflow:auto;padding:18px 24px 60px 24px;}
 ul.tree,ul.tree ul{list-style:none;margin:0;padding-left:14px;}
 ul.tree{padding-left:2px;}
-.row{display:flex;align-items:center;gap:6px;padding:2px 6px;border-radius:5px;cursor:pointer;
-     white-space:nowrap;}
+.row{display:flex;align-items:center;gap:4px;padding:3px 6px;border-radius:5px;cursor:pointer;
+     white-space:nowrap;user-select:none;-webkit-user-select:none;}
 .row:hover{background:var(--accent-soft);}
 .row.selected{background:var(--accent);color:#fff;}
 .row.selected .count,.row.selected .badge{background:rgba(255,255,255,.25);color:#fff;}
-.toggle{width:12px;display:inline-block;color:var(--muted);font-size:11px;}
+.toggle{flex:0 0 20px;width:20px;height:20px;display:inline-flex;align-items:center;
+        justify-content:center;color:var(--muted);font-size:11px;border-radius:4px;}
+.toggle.clickable:hover{background:var(--hover);color:var(--text);}
 .row.selected .toggle{color:#fff;}
-.icon{width:16px;text-align:center;}
-.label{overflow:hidden;text-overflow:ellipsis;}
+.row.selected .toggle.clickable:hover{background:rgba(255,255,255,.25);color:#fff;}
+.icon{flex:0 0 20px;width:20px;height:20px;display:inline-flex;align-items:center;
+      justify-content:center;border-radius:4px;}
+.icon.clickable:hover{background:var(--hover);}
+.row.selected .icon.clickable:hover{background:rgba(255,255,255,.25);}
+.label{overflow:hidden;text-overflow:ellipsis;padding:0 2px;}
 .count{font-size:11px;background:#eceff4;color:var(--muted);border-radius:9px;padding:0 6px;}
 .badge{font-size:11px;border-radius:9px;padding:1px 7px;background:#eceff4;color:var(--muted);}
 [data-theme="dark"] .count,[data-theme="dark"] .badge{background:#3a4050;color:var(--muted);}
@@ -1242,6 +1268,16 @@ table.kv td,table.kv th{border-bottom:1px solid var(--line);padding:5px 8px;
 table.kv td:first-child{color:var(--muted);width:34%;white-space:nowrap;}
 table.kv th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.05em;}
 table.kv td.v{font-family:"SFMono-Regular",Menlo,Consolas,monospace;word-break:break-all;}
+.tablewrap{overflow:auto;max-height:70vh;}
+table.data{border-collapse:collapse;width:100%;margin-bottom:6px;}
+table.data td,table.data th{border-bottom:1px solid var(--line);padding:4px 10px;
+       text-align:right;font-size:12px;white-space:nowrap;
+       font-family:"SFMono-Regular",Menlo,Consolas,monospace;}
+table.data th{position:sticky;top:0;background:var(--panel);color:var(--muted);
+       font-size:11px;text-transform:uppercase;letter-spacing:.05em;
+       font-family:inherit;text-align:right;}
+table.data td:first-child,table.data th:first-child{text-align:left;}
+table.data tbody tr:hover{background:var(--accent-soft);}
 .chips{display:flex;flex-wrap:wrap;gap:6px;}
 .chip{border:1px solid var(--line);border-radius:14px;padding:3px 10px;cursor:pointer;
       background:var(--chip-bg);color:var(--text);font-size:12px;}
@@ -1455,6 +1491,31 @@ _SCRIPT = r"""
     return rows.map(function (r) { return [r[0], cleanValue(r[1]), r[2]]; });
   }
 
+  /* --------------------------------- whitespace table parser (gamma files) */
+
+  function parseTable(text) {
+    var lines = String(text).split(/\r?\n/);
+    var headers = null, rows = [];
+    for (var i = 0; i < lines.length; i++) {
+      var line = lines[i].trim();
+      if (!line) { continue; }
+      var bare = line.replace(/^[#!]+\s*/, "").trim();
+      if (!bare) { continue; }
+      var toks = bare.split(/\s+/);
+      if (headers === null) {
+        if (/[A-Za-z_]/.test(bare) && !/^[-+.0-9]/.test(bare)) {
+          headers = toks;
+        } else {
+          headers = toks.map(function (_t, k) { return "column " + (k + 1); });
+          rows.push(toks);
+        }
+        continue;
+      }
+      rows.push(toks);
+    }
+    return {headers: headers || [], rows: rows};
+  }
+
   /* ---------------------------------------------------------------- boot */
 
   message("Loading simulation index\u2026");
@@ -1484,6 +1545,7 @@ _SCRIPT = r"""
         docs: r[7] || [],
         plots: r[8] || [],
         files: r[9] || [],
+        gamma: r[10] || [],
         children: [],
         sims: 0,
         models: 0,
@@ -1511,6 +1573,7 @@ _SCRIPT = r"""
 
     var ROOTS = NODES.filter(function (x) { return x.parent < 0; });
     var expanded = {}, current = null, activeTab = "Overview";
+    var rowEls = {};
 
     NODES.forEach(function (x) {
       expanded[x.id] = (x.kind === "root") || (x.depth <= 1 && x.kind === "folder");
@@ -1526,7 +1589,7 @@ _SCRIPT = r"""
 
     function kindLabel(kind) {
       return {root: "Root directory", folder: "Directory",
-              model: "Model", simulation: "Simulation"}[kind] || kind;
+              model: "Case", simulation: "Simulation"}[kind] || kind;
     }
 
     function iconFor(node) {
@@ -1535,7 +1598,7 @@ _SCRIPT = r"""
       return "\u25B0";
     }
 
-    /* a model/folder inherits the description of its first simulation */
+    /* a case/folder inherits the description of its first simulation */
     function reference(node) {
       if (node._ref !== undefined) { return node._ref; }
       var found = null;
@@ -1555,6 +1618,26 @@ _SCRIPT = r"""
       if (node.summary) { return node.summary; }
       var ref = reference(node);
       return ref ? ref.summary : "";
+    }
+
+    /* a simulation falls back to the growth-rate table of its case directory */
+    function growthOf(node) {
+      if (node._g !== undefined) { return node._g; }
+      var res = null;
+      if (node.gamma && node.gamma.length) {
+        res = {docs: node.gamma, owner: node, inherited: false};
+      } else if (node.kind === "simulation") {
+        var p = parentOf(node);
+        while (p) {
+          if (p.gamma && p.gamma.length) {
+            res = {docs: p.gamma, owner: p, inherited: true};
+            break;
+          }
+          p = parentOf(p);
+        }
+      }
+      node._g = res;
+      return res;
     }
 
     /* ---------------------------------------------------------- tree */
@@ -1586,6 +1669,7 @@ _SCRIPT = r"""
     function renderTree() {
       var q = query();
       var host = document.getElementById("tree");
+      rowEls = {};
       host.innerHTML = "";
       var ul = el("ul", "tree");
       ROOTS.forEach(function (node) {
@@ -1605,20 +1689,28 @@ _SCRIPT = r"""
       var li = el("li");
       var kids = node.children;
       var row = el("div", "row kind-" + node.kind);
+      row.setAttribute("data-id", String(node.id));
       if (current === node.id) { row.className += " selected"; }
+      rowEls[node.id] = row;
 
-      var tog = el("span", "toggle", kids.length ? (isOpen(node, q) ? "\u25BE" : "\u25B8") : "");
+      var tog = el("span", "toggle" + (kids.length ? " clickable" : ""),
+                   kids.length ? (isOpen(node, q) ? "\u25BE" : "\u25B8") : "");
       tog.addEventListener("click", function (ev) {
         ev.stopPropagation();
-        if (!kids.length) { return; }
-        expanded[node.id] = !isOpen(node, q);
-        renderTree();
+        toggle(node);
       });
       row.appendChild(tog);
-      row.appendChild(el("span", "icon", iconFor(node)));
+
+      var icon = el("span", "icon" + (kids.length ? " clickable" : ""), iconFor(node));
+      icon.addEventListener("click", function (ev) {
+        if (!kids.length) { return; }
+        ev.stopPropagation();
+        toggle(node);
+      });
+      row.appendChild(icon);
 
       var label = el("span", "label", node.name);
-      label.title = node.path;
+      label.title = node.path + (kids.length ? "  (double-click to expand)" : "");
       row.appendChild(label);
 
       if (node.kind === "simulation" && node.code) {
@@ -1641,20 +1733,52 @@ _SCRIPT = r"""
       return li;
     }
 
+    function toggle(node) {
+      if (!node || !node.children.length) { return; }
+      expanded[node.id] = !isOpen(node, query());
+      renderTree();
+    }
+
+    function markSelected() {
+      var prev = document.querySelector(".row.selected");
+      if (prev) { prev.classList.remove("selected"); }
+      var e = rowEls[current];
+      if (e) {
+        e.classList.add("selected");
+        if (e.scrollIntoView) { e.scrollIntoView({block: "nearest"}); }
+      }
+    }
+
     function select(id) {
       var node = NODES[id];
       if (!node) { return; }
       current = id;
-      var p = parentOf(node);
-      while (p) { expanded[p.id] = true; p = parentOf(p); }
-      renderTree();
+
+      var changed = false, p = parentOf(node);
+      while (p) {
+        if (!expanded[p.id]) { expanded[p.id] = true; changed = true; }
+        p = parentOf(p);
+      }
+
+      if (changed || !rowEls[id]) { renderTree(); }
+      markSelected();
       renderDetail(node);
+
       if (window.history && window.history.replaceState) {
         window.history.replaceState(null, "", "#n" + id);
       }
-      var sel = document.querySelector(".row.selected");
-      if (sel && sel.scrollIntoView) { sel.scrollIntoView({block: "nearest"}); }
     }
+
+    /* double-click anywhere on a row expands / collapses it */
+    document.getElementById("tree").addEventListener("dblclick", function (ev) {
+      var row = ev.target;
+      while (row && row !== this && !row.getAttribute("data-id")) {
+        row = row.parentNode;
+      }
+      if (!row || row === this) { return; }
+      ev.preventDefault();
+      toggle(NODES[parseInt(row.getAttribute("data-id"), 10)]);
+    });
 
     /* -------------------------------------------------------- detail */
 
@@ -1679,6 +1803,28 @@ _SCRIPT = r"""
       return t;
     }
 
+    function dataTable(headers, rows) {
+      var wrap = el("div", "tablewrap");
+      var t = el("table", "data");
+      if (headers.length) {
+        var thead = el("thead"), htr = el("tr");
+        headers.forEach(function (h) { htr.appendChild(el("th", null, h)); });
+        thead.appendChild(htr);
+        t.appendChild(thead);
+      }
+      var tb = el("tbody");
+      rows.forEach(function (r) {
+        var tr = el("tr");
+        for (var c = 0; c < Math.max(headers.length, r.length); c++) {
+          tr.appendChild(el("td", null, r[c] === undefined ? "" : r[c]));
+        }
+        tb.appendChild(tr);
+      });
+      t.appendChild(tb);
+      wrap.appendChild(t);
+      return wrap;
+    }
+
     function crumbs(node) {
       var chain = [], p = node;
       while (p) { chain.unshift(p); p = parentOf(p); }
@@ -1699,7 +1845,7 @@ _SCRIPT = r"""
       node.info.forEach(function (r) { rows.push([LABELS[r[0]] || "", r[1]]); });
       if (node.kind !== "simulation") {
         rows.push(["Simulations below", String(node.sims)]);
-        if (node.models) { rows.push(["Models below", String(node.models)]); }
+        if (node.models) { rows.push(["Cases below", String(node.models)]); }
       }
       return rows;
     }
@@ -1762,6 +1908,24 @@ _SCRIPT = r"""
       return d._p;
     }
 
+    function docTable(d) {
+      if (d._t === undefined) { d._t = parseTable(TEXTS[d[1]] || ""); }
+      return d._t;
+    }
+
+    function docBar(docs, state, draw, node) {
+      var bar = el("div", "docbar");
+      docs.forEach(function (d, i) {
+        var b = el("button", "doctab" + (i === state.idx ? " active" : ""), d[0]);
+        b.title = node.path + SEP + d[0];
+        b.addEventListener("click", function () {
+          state.idx = i; state.filter = ""; draw();
+        });
+        bar.appendChild(b);
+      });
+      return bar;
+    }
+
     function inputsPanel(node) {
       var panel = el("div", "panel");
       var docs = node.docs;
@@ -1775,17 +1939,7 @@ _SCRIPT = r"""
 
       function draw() {
         panel.innerHTML = "";
-
-        var bar = el("div", "docbar");
-        docs.forEach(function (d, i) {
-          var b = el("button", "doctab" + (i === state.idx ? " active" : ""), d[0]);
-          b.title = node.path + SEP + d[0];
-          b.addEventListener("click", function () {
-            state.idx = i; state.filter = ""; draw();
-          });
-          bar.appendChild(b);
-        });
-        panel.appendChild(bar);
+        panel.appendChild(docBar(docs, state, draw, node));
 
         var doc = docs[state.idx];
         var text = TEXTS[doc[1]] || "";
@@ -1794,10 +1948,10 @@ _SCRIPT = r"""
           node.path + SEP + doc[0] + "  \u2022  " + humanSize(doc[2] || 0) +
           (doc[3] ? "  \u2022  (display truncated)" : "")));
 
-        var toggle = el("button", "chip",
+        var toggleBtn = el("button", "chip",
           state.raw ? "Show parsed parameters" : "Show raw file");
-        toggle.addEventListener("click", function () { state.raw = !state.raw; draw(); });
-        panel.appendChild(toggle);
+        toggleBtn.addEventListener("click", function () { state.raw = !state.raw; draw(); });
+        panel.appendChild(toggleBtn);
 
         var params = state.raw ? [] : docParams(doc);
 
@@ -1838,6 +1992,53 @@ _SCRIPT = r"""
           holder.appendChild(kvTable(rows, ["Parameter", "Value", "Namelist group"]));
         }
         drawTable();
+      }
+
+      draw();
+      return panel;
+    }
+
+    function growthPanel(node) {
+      var panel = el("div", "panel");
+      var g = growthOf(node);
+      if (!g) {
+        panel.appendChild(el("p", "muted",
+          "No growth-rate file was found for this entry."));
+        return panel;
+      }
+
+      var docs = g.docs;
+      var state = {idx: 0, raw: false, filter: ""};
+
+      function draw() {
+        panel.innerHTML = "";
+        if (docs.length > 1) {
+          panel.appendChild(docBar(docs, state, draw, g.owner));
+        }
+
+        var doc = docs[state.idx];
+        var text = TEXTS[doc[1]] || "";
+
+        panel.appendChild(el("p", "muted",
+          g.owner.path + SEP + doc[0] + "  \u2022  " + humanSize(doc[2] || 0) +
+          (doc[3] ? "  \u2022  (display truncated)" : "") +
+          (g.inherited ? "  \u2022  inherited from " + g.owner.name : "")));
+
+        var toggleBtn = el("button", "chip",
+          state.raw ? "Show table" : "Show raw file");
+        toggleBtn.addEventListener("click", function () { state.raw = !state.raw; draw(); });
+        panel.appendChild(toggleBtn);
+
+        if (!state.raw) {
+          var tbl = docTable(doc);
+          if (tbl.rows.length) {
+            panel.appendChild(dataTable(tbl.headers, tbl.rows));
+            return;
+          }
+          panel.appendChild(el("p", "muted",
+            "The file could not be interpreted as a table; showing the raw file."));
+        }
+        panel.appendChild(el("pre", "raw", text));
       }
 
       draw();
@@ -1910,10 +2111,16 @@ _SCRIPT = r"""
       head.appendChild(el("p", "path", node.path));
       host.appendChild(head);
 
-      var names = ["Overview", "Inputs", "Plots"];
+      var growth = growthOf(node);
+      var names = ["Overview", "Inputs"];
+      if (growth) { names.push("Growth rates"); }
+      names.push("Plots");
+
       var counts = {
         "Overview": "",
         "Inputs": node.docs.length ? " (" + node.docs.length + ")" : "",
+        "Growth rates": (growth && growth.docs.length > 1)
+                          ? " (" + growth.docs.length + ")" : "",
         "Plots": node.plots.length ? " (" + node.plots.length + ")" : ""
       };
       if (names.indexOf(activeTab) < 0) { activeTab = "Overview"; }
@@ -1927,6 +2134,7 @@ _SCRIPT = r"""
       host.appendChild(tabs);
 
       if (activeTab === "Inputs") { host.appendChild(inputsPanel(node)); }
+      else if (activeTab === "Growth rates") { host.appendChild(growthPanel(node)); }
       else if (activeTab === "Plots") { host.appendChild(plotsPanel(node)); }
       else { host.appendChild(overviewPanel(node)); }
     }
@@ -1936,16 +2144,21 @@ _SCRIPT = r"""
     function setAll(flag) {
       NODES.forEach(function (x) { expanded[x.id] = flag; });
       renderTree();
+      markSelected();
     }
 
-    document.getElementById("search").addEventListener("input", renderTree);
+    document.getElementById("search").addEventListener("input", function () {
+      renderTree();
+      markSelected();
+    });
     document.getElementById("expand-all").addEventListener("click", function () {
       setAll(true);
     });
     document.getElementById("collapse-all").addEventListener("click", function () {
-      setAll(false);
+      NODES.forEach(function (x) { expanded[x.id] = false; });
       ROOTS.forEach(function (x) { expanded[x.id] = true; });
       renderTree();
+      markSelected();
     });
 
     renderTree();
@@ -1990,7 +2203,7 @@ _PAGE = Template("""<!DOCTYPE html>
 
 def _stats_line(stats):
     bits = ["%d root director%s" % (stats["roots"], "y" if stats["roots"] == 1 else "ies"),
-            "%d model(s)" % stats["models"],
+            "%d case(s)" % stats["models"],
             "%d simulation(s)" % stats["simulations"]]
     for code, n in sorted(stats.get("by_code", {}).items()):
         bits.append("%d %s" % (n, CODE_LABELS.get(code, code)))
@@ -2039,7 +2252,7 @@ def build_browser(sources,
         If True, image files found in the simulation directory (or in a
         'plots/' / 'figures/' subdirectory) are linked in the "Plots" tab.
     max_doc_bytes : int
-        Maximum number of characters shown per input file.
+        Maximum number of characters shown per input / growth-rate file.
     max_files : int
         Maximum number of entries shown in the per-directory file listing
         (0 disables the listing completely).
@@ -2125,8 +2338,8 @@ def main(argv=None):
                              "(disabled by default; the Plots tab then shows a "
                              "placeholder).")
     parser.add_argument("--max-doc-bytes", type=int, default=DEFAULT_MAX_DOC_BYTES,
-                        help="Maximum characters embedded per input file "
-                             "(default: %d)." % DEFAULT_MAX_DOC_BYTES)
+                        help="Maximum characters embedded per input / growth-rate "
+                             "file (default: %d)." % DEFAULT_MAX_DOC_BYTES)
     parser.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES,
                         help="Maximum entries in the per-directory file listing, "
                              "0 disables it (default: %d)." % DEFAULT_MAX_FILES)

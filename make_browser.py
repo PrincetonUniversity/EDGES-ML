@@ -4,13 +4,20 @@ make_browser.py  –  manual generator for the edges-ml simulation browser.
 
 Run this script whenever new simulation data has been added to the directories
 you want to expose.  It crawls the directory trees, reads the code input
-namelists, works out which physical model each simulation uses, and writes a
-single self-contained HTML file that can be opened directly in a browser (or
-copied to a web server).
+namelists, works out which physical model each simulation uses, picks up the
+M3D-C1 growth-rate tables, and writes a single self-contained HTML file that
+can be opened directly in a browser (or copied to a web server).
 
-The embedded data is packed and gzip-compressed, and the namelists are only
-parsed in the browser when you actually open them, so the page stays small and
-responsive even for large databases.
+The embedded data is packed and gzip-compressed, and the namelists / growth-rate
+tables are only parsed in the browser when you actually open them, so the page
+stays small and responsive even for large databases.
+
+Tabs in the generated page
+--------------------------
+    Overview      metadata, physical model, contents, directory listing
+    Inputs        C1input (M3D-C1), nimrod.in / nimeq.in (NIMROD), README...
+    Growth rates  the M3D-C1 'gamma' output table (when present)
+    Plots         figures (only with --scan-plots)
 
 Examples
 --------
