@@ -29,11 +29,11 @@ edges-build-dataset = "edges_ml.cli:main"
 
 [tool.setuptools]
 include-package-data = true
-
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["edges_ml*"]
-exclude = ["build*", "dist*", "tests*", "docs*"]
-# Without the following line, setuptools may pick up 'edges_ml/' as an implicit
-# namespace package.
-namespaces = false
+# The package list is given EXPLICITLY (rather than via packages.find) on
+# purpose: if 'edges_ml/__init__.py' is missing, or the copied source tree is
+# incomplete, the build then fails loudly instead of silently installing
+# 'edges_ml' as an implicit NAMESPACE package. A namespace package imports
+# fine but has '__file__ is None' and exports nothing, which surfaces as
+# confusing errors such as:
+#     AttributeError: module 'edges_ml' has no attribute 'GridSpec'
+packages = ["edges_ml"]
