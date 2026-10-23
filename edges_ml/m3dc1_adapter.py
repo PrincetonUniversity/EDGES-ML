@@ -14,8 +14,8 @@ The adapter works in two modes:
     in an HPC campaign archive.  Every fpy.sim_data object is then opened with
     filetype='adios2' and the data is streamed over SSH on demand.
 
-Two pieces of global state make the M3D-C1 / fusion-io stack fragile when
-several sim_data objects are alive at the same time; both are handled here:
+Three pieces of shared state make the M3D-C1 / fusion-io stack fragile; all of
+them are handled here:
 
 1.  fio_py.set_int_option(FIO_TIMESLICE, ...) is GLOBAL, not per source.
     Creating any other sim_data object (for instance the short-lived
@@ -32,6 +32,13 @@ several sim_data objects are alive at the same time; both are handled here:
     fails with 'Unable to synchronously open file (file signature not found)'.
     _h5_filename() hands out the HDF5 skeletons that fusion-io extracts from
     the archive instead.
+
+3.  Not every run writes every diagnostic (pellet / KPRAD / wall-force traces
+    are typically absent).  Asking for one of those costs a full SSH round trip
+    and then raises an exception whose text contains the complete remote stderr
+    (Lmod chatter plus a remote traceback).  The requested traces are therefore
+    pre-filtered against what the simulation really contains, and any remaining
+    failure is reported with utils.brief_error() as a single short line.
 """
 
 import os
@@ -69,6 +76,7 @@ from .campaign import CampaignArchive, CampaignContext
 from .utils import (
     printwarn, printerr, printnote,
     compute_file_hash, auto_cast, generate_unique_filename,
+    brief_error, is_missing_error, summarize_names,
     GridSpec,
     _infer_machine_and_shot, _allocate_imas_run, _imas_entry_dir,
 )
@@ -77,6 +85,9 @@ from .utils import (
 class M3DC1Adapter(SimulationAdapter):
 
     CODE_NAME = "M3D-C1"
+
+    # Traces that fpy exposes even though they are not datasets of 'scalars'.
+    _SYNTHETIC_TRACES = ("time", "bharmonics", "keharmonics")
 
     def __init__(self, model_dir, campaign=None):
         super().__init__(model_dir)
@@ -94,6 +105,11 @@ class M3DC1Adapter(SimulationAdapter):
 
         # Cached h5py-openable filename for campaign (skeleton) mode.
         self._campaign_h5_file = None
+
+        # Time-trace bookkeeping (see _available_traces / get_time_trace).
+        self._trace_names = None
+        self._skipped_traces = set()
+        self._failed_traces = set()
 
         # Mode directories (local paths) or campaign simulation paths.
         if campaign is not None and getattr(campaign, "modes", None):
@@ -204,7 +220,8 @@ class M3DC1Adapter(SimulationAdapter):
             except NameError:
                 pass
             except Exception as exc:
-                printerr(f"Could not open equilibrium simulation ({target}): {exc}")
+                printerr(f"Could not open equilibrium simulation ({target}): "
+                         f"{brief_error(exc)}")
                 self._eq_sim = None
         return self._eq_sim
 
@@ -223,7 +240,8 @@ class M3DC1Adapter(SimulationAdapter):
             except NameError:
                 self._mode_sims[key] = None
             except Exception as exc:
-                printerr(f"Could not open mode simulation ({target}): {exc}")
+                printerr(f"Could not open mode simulation ({target}): "
+                         f"{brief_error(exc)}")
                 self._mode_sims[key] = None
         return self._mode_sims.get(key)
 
@@ -240,12 +258,23 @@ class M3DC1Adapter(SimulationAdapter):
             except NameError:
                 return None
             except Exception as exc:
-                printerr(f"Could not open simulation for time slice {time_slice}: {exc}")
+                printerr(f"Could not open simulation for time slice {time_slice}: "
+                         f"{brief_error(exc)}")
                 self._time_sims[time_slice] = None
         return self._time_sims.get(time_slice)
 
     def close(self):
         """Drops the cached fpy objects (closing SSH connections in campaign mode)."""
+        if self._skipped_traces:
+            printnote(
+                f"Skipped {len(self._skipped_traces)} time trace(s) that this "
+                f"simulation does not write: "
+                f"{summarize_names(self._skipped_traces)}"
+            )
+        self._skipped_traces = set()
+        self._failed_traces = set()
+        self._trace_names = None
+
         self._eq_sim = None
         self._mode_sims = {}
         self._time_sims = {}
@@ -285,7 +314,7 @@ class M3DC1Adapter(SimulationAdapter):
         try:
             sim.set_timeslice(int(ts))
         except Exception as exc:
-            printwarn(f"Could not re-assert M3D-C1 time slice {ts}: {exc}")
+            printwarn(f"Could not re-assert M3D-C1 time slice {ts}: {brief_error(exc)}")
 
     def _sim_time(self, sim, default=-1):
         """Returns the time slice an evaluation should be performed at."""
@@ -330,7 +359,8 @@ class M3DC1Adapter(SimulationAdapter):
                 # ... and the equilibrium.h5 / time_NNN.h5 siblings.
                 backend.ensure_all_skeletons_in_cwd()
             except Exception as exc:
-                printwarn(f"Could not extract the campaign HDF5 skeletons: {exc}")
+                printwarn(f"Could not extract the campaign HDF5 skeletons: "
+                          f"{brief_error(exc)}")
 
         candidate = Path.cwd() / 'C1.h5'
         if candidate.exists():
@@ -375,14 +405,16 @@ class M3DC1Adapter(SimulationAdapter):
                              time=-1, units=self._map_units(units), coord='scalar')
                 fc = getattr(eq, 'fc', None)
             except Exception as exc:
-                printwarn(f"Could not pre-compute the equilibrium flux coordinates: {exc}")
+                printwarn(f"Could not pre-compute the equilibrium flux coordinates: "
+                          f"{brief_error(exc)}")
                 fc = None
 
         if fc is not None:
             try:
                 sim.fc = fc
             except Exception as exc:
-                printwarn(f"Could not reuse the equilibrium flux coordinates: {exc}")
+                printwarn(f"Could not reuse the equilibrium flux coordinates: "
+                          f"{brief_error(exc)}")
 
     # -----------------------------------------------------------------------
     # Metadata / inputs
@@ -529,7 +561,8 @@ class M3DC1Adapter(SimulationAdapter):
                 for basename, meta in sorted(archive.files_for(mode_dir).items()):
                     info[basename] = meta.get("uuid", "")
             except Exception as exc:
-                printwarn(f"Could not read dataset UUIDs for {mode_dir}: {exc}")
+                printwarn(f"Could not read dataset UUIDs for {mode_dir}: "
+                          f"{brief_error(exc)}")
             return info
 
         hashes = {}
@@ -576,7 +609,7 @@ class M3DC1Adapter(SimulationAdapter):
                 shape_dict = get_shape(sim, quiet=True)
                 globals_dict.update(shape_dict)
         except Exception as e:
-            printwarn(f"Warning: Could not calculate shaping parameters: {e}")
+            printwarn(f"Warning: Could not calculate shaping parameters: {brief_error(e)}")
 
         return globals_dict
 
@@ -725,20 +758,77 @@ class M3DC1Adapter(SimulationAdapter):
                                          units=m3dc1_units, coord='scalar')
                 return np.asarray(nflux), np.asarray(fa)
         except Exception as e:
-            printerr(f"Error calculating flux average for {name}: {e}")
+            msg = f"Flux average '{name}' (time={time}) failed: {brief_error(e)}"
+            if is_missing_error(e):
+                printwarn(msg)
+            else:
+                printerr(msg)
             return np.array([]), np.array([])
         finally:
             # flux_average() may have created (and destroyed) its own sim
             # object, which resets fusion-io's global time slice.
             self._sync_timeslice(sim)
 
+    # -----------------------------------------------------------------------
+    # Time traces
+    # -----------------------------------------------------------------------
+
+    def _available_traces(self, sim):
+        """
+        Returns the set of time-trace names this simulation actually contains.
+
+        fpy exposes the datasets of the 'scalars' group through
+        sim.available_traces; the pellet diagnostics live in a separate
+        'pellet' group and are added here.  An empty set means 'could not
+        determine', in which case no filtering is applied.
+        """
+        if self._trace_names is not None:
+            return self._trace_names
+
+        names = set(self._SYNTHETIC_TRACES)
+
+        try:
+            names.update(getattr(sim, 'available_traces', None) or [])
+        except Exception:
+            pass
+
+        # Pellet diagnostics ('pellet/<name>').
+        try:
+            if self.is_campaign:
+                backend = getattr(sim, '_aca', None)
+                if backend is not None and backend.group_exists('pellet'):
+                    names.update(backend.list_group('pellet'))
+            else:
+                h5 = getattr(sim, '_all_attrs', None)
+                if h5 is not None and 'pellet' in h5:
+                    names.update(h5['pellet'].keys())
+        except Exception:
+            pass
+
+        # If only the synthetic names are known, discovery evidently failed;
+        # fall back to "try everything" rather than skipping all traces.
+        if len(names) <= len(self._SYNTHETIC_TRACES):
+            names = set()
+
+        self._trace_names = names
+        return names
+
     def get_time_trace(self, name, units):
         """
         Extracts the requested scalar time trace using the native get_timetrace function.
         Returns a tuple of (time_array, values_array) as 1D numpy arrays.
+
+        Quantities that this run simply does not write (pellet / KPRAD / wall
+        force diagnostics, ...) are skipped without contacting the remote host;
+        they are reported as a single summary line by close().
         """
         sim = self._get_eq_sim()
         if sim is None:
+            return np.array([]), np.array([])
+
+        known = self._available_traces(sim)
+        if known and name not in known:
+            self._skipped_traces.add(name)
             return np.array([]), np.array([])
 
         m3dc1_units = self._map_units(units)
@@ -751,8 +841,17 @@ class M3DC1Adapter(SimulationAdapter):
             )
             return np.asarray(time_arr), np.asarray(values)
         except Exception as e:
-            printerr(f"Error extracting time trace {name}: {e}")
+            if is_missing_error(e):
+                # Not present in this run - record it and stay quiet.
+                self._skipped_traces.add(name)
+            elif name not in self._failed_traces:
+                self._failed_traces.add(name)
+                printerr(f"Time trace '{name}' failed: {brief_error(e)}")
             return np.array([]), np.array([])
+
+    # -----------------------------------------------------------------------
+    # Mode data
+    # -----------------------------------------------------------------------
 
     def get_mode_metadata(self, mode_dir):
         """Extracts growth rates and mode type specifically matching this directory's n."""
@@ -842,12 +941,13 @@ class M3DC1Adapter(SimulationAdapter):
             try:
                 meta["simulation_time"][i] = get_time_of_slice(ts, sim=sim, filename=c1_file, units='m3dc1')
             except Exception as e:
-                printerr(f"Error extracting simulation_time for slice {ts}: {e}")
+                printerr(f"Could not read simulation_time for slice {ts}: {brief_error(e)}")
 
             try:
                 meta["simulation_time_step"][i] = int(readParameter('ntimestep', h5file=h5file))
             except Exception as e:
-                printerr(f"Error extracting ntimestep for slice {ts} from {fname}: {e}")
+                printwarn(f"Could not read ntimestep for slice {ts} ({fname}): "
+                          f"{brief_error(e)}")
 
             self._sync_timeslice(sim)
 
@@ -898,7 +998,8 @@ class M3DC1Adapter(SimulationAdapter):
                     nz=res,
                 )
             except Exception as exc:
-                printerr(f"convert2imas (standalone) failed for {self.model_dir}: {exc}")
+                printerr(f"convert2imas (standalone) failed for {self.model_dir}: "
+                         f"{brief_error(exc)}")
                 return None
 
             return {
@@ -936,7 +1037,8 @@ class M3DC1Adapter(SimulationAdapter):
                     db_path=db_path,
                 )
             except Exception as exc:
-                printerr(f"convert2imas_imaspy failed for {self.model_dir}: {exc}")
+                printerr(f"convert2imas_imaspy failed for {self.model_dir}: "
+                         f"{brief_error(exc)}")
                 return None
 
             entry = _imas_entry_dir(db_path, db_name, db_version, pulse, run)
@@ -980,7 +1082,7 @@ class M3DC1Adapter(SimulationAdapter):
                     self._sync_timeslice(sim)
                     self._inner_wall_points = get_points_inside_inner_wall(sim=sim, quiet=True)
                 except Exception as e:
-                    printerr(f"Error obtaining inner wall points: {e}")
+                    printerr(f"Error obtaining inner wall points: {brief_error(e)}")
                     self._inner_wall_points = np.array([])
 
         return self._inner_wall_points

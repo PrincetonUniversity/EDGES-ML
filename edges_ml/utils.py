@@ -34,6 +34,132 @@ def printnote(string):
 
 
 # ===========================================================================
+# EXCEPTION MESSAGE CONDENSING
+# ===========================================================================
+#
+# Remote (campaign-archive) operations run a helper script over SSH.  When that
+# script fails, the exception text contains the *complete* remote stderr: the
+# cluster's Lmod module-system chatter followed by a Python traceback.  Printing
+# that verbatim for a quantity that simply does not exist in a given simulation
+# buries the actual information in ~40 lines of noise.
+#
+# brief_error() reduces such a message to the single most informative line, and
+# is_missing_error() recognises the "this dataset/object does not exist" case so
+# that callers can downgrade it from an error to a short warning.
+# ---------------------------------------------------------------------------
+
+# Lines that are pure noise and must never be chosen as "the" error message.
+_ERR_NOISE_RES = (
+    re.compile(r'^\s*Traceback'),
+    re.compile(r'^\s*File "'),
+    re.compile(r'^\s*\w+\s*=\s*'),                       # source echo in traceback
+    re.compile(r'^\s*[~^]+\s*$'),                        # caret markers
+    re.compile(r'^\s*return\b'),
+    re.compile(r'^\s*oid\s*='),
+    re.compile(r'Lmod has detected', re.IGNORECASE),
+    re.compile(r'module\s+(spider|--ignore_cache|load|swap)', re.IGNORECASE),
+    re.compile(r'^\s*\$\s*module', re.IGNORECASE),
+    re.compile(r'module\(s\) are unknown', re.IGNORECASE),
+    re.compile(r'Please check the spelling', re.IGNORECASE),
+    re.compile(r'It is also possible your cache file', re.IGNORECASE),
+    re.compile(r'Also (try|make sure)', re.IGNORECASE),
+    re.compile(r'modulefiles written in TCL', re.IGNORECASE),
+    re.compile(r'^\s*#%Module'),
+    re.compile(r'Module fullname', re.IGNORECASE),
+    re.compile(r'^\s*-+\s+-+\s*$'),
+    re.compile(r'Executing this command requires loading', re.IGNORECASE),
+    re.compile(r'Swap failed', re.IGNORECASE),
+    re.compile(r'(cray-|PrgEnv-|m3dc1/|gsl|fftw|hdf5)', re.IGNORECASE),
+    re.compile(r'^\s*"[^"]*"\s*("[^"]*"\s*)*$'),         # bare lists of module names
+    re.compile(r'^\s*$'),
+)
+
+# Lines that typically carry the real cause, searched from the bottom up.
+_ERR_CAUSE_RES = (
+    re.compile(r"\bKeyError\b"),
+    re.compile(r"\bFileNotFoundError\b"),
+    re.compile(r"\b(Value|Type|Index|Runtime|OS|Attribute)Error\b"),
+    re.compile(r"doesn'?t exist", re.IGNORECASE),
+    re.compile(r"not found", re.IGNORECASE),
+    re.compile(r"no such (file|object|dataset|group)", re.IGNORECASE),
+    re.compile(r"unable to (synchronously )?open", re.IGNORECASE),
+)
+
+# Patterns that identify "the requested quantity is simply not in this file".
+_MISSING_RES = (
+    re.compile(r"doesn'?t exist", re.IGNORECASE),
+    re.compile(r"no such (file|object|dataset|group)", re.IGNORECASE),
+    re.compile(r"unable to (synchronously )?open (object|attribute)", re.IGNORECASE),
+    re.compile(r"can't locate (attribute|object)", re.IGNORECASE),
+    re.compile(r"\bKeyError\b"),
+    re.compile(r"No array data returned", re.IGNORECASE),
+    re.compile(r"No npz data returned", re.IGNORECASE),
+    re.compile(r"not available", re.IGNORECASE),
+)
+
+
+def _is_noise_line(line):
+    return any(pat.search(line) for pat in _ERR_NOISE_RES)
+
+
+def brief_error(exc, max_chars=220):
+    """
+    Condenses a (possibly huge, multi-line) exception into a single short line.
+
+    Remote failures carry the full SSH stderr; this keeps only the line that
+    actually says what went wrong and prefixes it with the exception type.
+    """
+    if exc is None:
+        return ""
+
+    name = type(exc).__name__ if isinstance(exc, BaseException) else ""
+    text = str(exc).strip()
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    if not lines:
+        return name or "unknown error"
+
+    chosen = None
+    for pat in _ERR_CAUSE_RES:
+        for ln in reversed(lines):
+            if pat.search(ln) and not _is_noise_line(ln):
+                chosen = ln
+                break
+        if chosen is not None:
+            break
+
+    if chosen is None:
+        for ln in lines:
+            if not _is_noise_line(ln):
+                chosen = ln
+                break
+
+    if chosen is None:
+        chosen = lines[0]
+
+    chosen = re.sub(r"\s+", " ", chosen).strip()
+    if len(chosen) > max_chars:
+        chosen = chosen[:max_chars - 1].rstrip() + "\u2026"
+
+    if name and name not in chosen:
+        return f"{name}: {chosen}"
+    return chosen
+
+
+def is_missing_error(exc):
+    """
+    True if *exc* indicates that the requested dataset / attribute is simply
+    absent from the file (as opposed to a genuine failure).
+    """
+    if exc is None:
+        return False
+    if isinstance(exc, (KeyError, FileNotFoundError)):
+        return True
+    text = str(exc)
+    return any(pat.search(text) for pat in _MISSING_RES)
+
+
+# ===========================================================================
 # QUANTITY REGISTRIES & LABELS
 # ===========================================================================
 
@@ -257,6 +383,19 @@ def expand_request(selection, registry):
             return list(registry)
 
     return items
+
+
+def summarize_names(names, max_shown=8):
+    """
+    Formats a collection of names for a one-line log message, e.g.
+        'a, b, c, ... (+12 more)'
+    """
+    items = sorted(set(str(n) for n in names))
+    if not items:
+        return ""
+    if len(items) <= max_shown:
+        return ", ".join(items)
+    return ", ".join(items[:max_shown]) + f", ... (+{len(items) - max_shown} more)"
 
 
 @dataclass
