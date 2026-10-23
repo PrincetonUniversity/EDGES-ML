@@ -13,6 +13,25 @@ The adapter works in two modes:
     'campaign' is a CampaignContext describing a remote simulation registered
     in an HPC campaign archive.  Every fpy.sim_data object is then opened with
     filetype='adios2' and the data is streamed over SSH on demand.
+
+Two pieces of global state make the M3D-C1 / fusion-io stack fragile when
+several sim_data objects are alive at the same time; both are handled here:
+
+1.  fio_py.set_int_option(FIO_TIMESLICE, ...) is GLOBAL, not per source.
+    Creating any other sim_data object (for instance the short-lived
+    equilibrium object that m3dc1's flux_average() opens internally) silently
+    changes the time slice that every subsequent field evaluation uses.  In
+    campaign mode this surfaces as
+        'm3dc1_numpy_source::get_field: fields ... not injected for timeslice -1'
+    followed by 'SystemError: get_field() returned NULL ...'.
+    _sync_timeslice() re-asserts the time slice of the sim object that is
+    about to be used.
+
+2.  Several m3dc1 helpers open 'filename' with h5py as a fallback.  In
+    campaign mode sim.filename is the .aca archive (an SQLite database), which
+    fails with 'Unable to synchronously open file (file signature not found)'.
+    _h5_filename() hands out the HDF5 skeletons that fusion-io extracts from
+    the archive instead.
 """
 
 import os
@@ -72,6 +91,9 @@ class M3DC1Adapter(SimulationAdapter):
         self._eq_sim = None
         self._mode_sims = {}
         self._time_sims = {}
+
+        # Cached h5py-openable filename for campaign (skeleton) mode.
+        self._campaign_h5_file = None
 
         # Mode directories (local paths) or campaign simulation paths.
         if campaign is not None and getattr(campaign, "modes", None):
@@ -234,6 +256,133 @@ class M3DC1Adapter(SimulationAdapter):
         if u == 'codeunits':
             return 'm3dc1'
         return u
+
+    # -----------------------------------------------------------------------
+    # Robustness helpers for the shared fusion-io / m3dc1 global state
+    # -----------------------------------------------------------------------
+
+    def _sync_timeslice(self, sim):
+        """
+        Re-asserts the time slice of *sim* on fusion-io's GLOBAL option stack.
+
+        fio_py.set_int_option(FIO_TIMESLICE, ...) is process-wide state shared
+        by every open source.  fpy only sets it when a sim_data object is
+        created (or when set_timeslice() is called explicitly), so creating any
+        other sim_data object in between — which m3dc1's flux_average() does
+        internally whenever it needs the equilibrium flux surfaces — silently
+        re-points every subsequent field evaluation at the wrong time slice.
+
+        With the numpy (campaign) source this is fatal:
+            m3dc1_numpy_source::get_field: fields 'psi' or 'I' not injected
+            for timeslice -1
+            SystemError: <built-in function get_field> returned NULL ...
+        """
+        if sim is None:
+            return
+        ts = getattr(sim, 'timeslice', None)
+        if ts is None:
+            return
+        try:
+            sim.set_timeslice(int(ts))
+        except Exception as exc:
+            printwarn(f"Could not re-assert M3D-C1 time slice {ts}: {exc}")
+
+    def _sim_time(self, sim, default=-1):
+        """Returns the time slice an evaluation should be performed at."""
+        ts = getattr(sim, 'timeslice', None)
+        if ts is None:
+            return default
+        try:
+            return int(ts)
+        except (TypeError, ValueError):
+            return default
+
+    def _h5_filename(self, sim=None):
+        """
+        Returns a path that the m3dc1 helpers can open with h5py.
+
+        Several helpers (flux_average, get_timetrace, readParameter, ...) fall
+        back to reading the simulation file directly.  In campaign mode
+        sim.filename is the .aca archive, i.e. an SQLite database, so h5py
+        aborts with
+            'Unable to synchronously open file (file signature not found)'.
+
+        fusion-io extracts the embedded HDF5 skeletons of the archive and links
+        them into the current working directory (C1.h5, equilibrium.h5,
+        time_NNN.h5), so those are handed out instead.
+        """
+        if not self.is_campaign:
+            if sim is not None and getattr(sim, 'filename', None):
+                return sim.filename
+            return self._sim_filename()
+
+        if self._campaign_h5_file is not None:
+            return self._campaign_h5_file
+
+        backend = getattr(sim, '_aca', None)
+        if backend is None:
+            backend = getattr(self._eq_sim, '_aca', None)
+
+        if backend is not None:
+            try:
+                # Creates (and links into the CWD) the C1.h5 skeleton ...
+                backend.get_skeleton_path('C1.h5')
+                # ... and the equilibrium.h5 / time_NNN.h5 siblings.
+                backend.ensure_all_skeletons_in_cwd()
+            except Exception as exc:
+                printwarn(f"Could not extract the campaign HDF5 skeletons: {exc}")
+
+        candidate = Path.cwd() / 'C1.h5'
+        if candidate.exists():
+            self._campaign_h5_file = str(candidate)
+            return self._campaign_h5_file
+
+        if backend is not None:
+            try:
+                self._campaign_h5_file = str(backend.get_skeleton_path('C1.h5'))
+                return self._campaign_h5_file
+            except Exception:
+                pass
+
+        return getattr(sim, 'filename', None) or self._sim_filename()
+
+    def _attach_equilibrium_fc(self, sim, resolution, units, fcoords):
+        """
+        Hands the cached equilibrium flux-coordinate system to a finite-time
+        sim object (campaign mode only).
+
+        With use_eq_fs=True, m3dc1's flux_average() needs the equilibrium flux
+        coordinates.  If the sim object it is given does not carry them it
+        opens the simulation file itself to build a fresh equilibrium object —
+        which cannot work for a campaign archive.  Since 'use_eq_fs' means
+        'use the equilibrium flux surfaces' anyway, we simply reuse the object
+        that was already computed on the cached equilibrium sim.
+        """
+        if sim is None or getattr(sim, 'fc', None) is not None:
+            return
+
+        eq = self._get_eq_sim()
+        if eq is None or eq is sim:
+            return
+
+        fc = getattr(eq, 'fc', None)
+        if fc is None:
+            # Force the equilibrium flux coordinates to be computed once.
+            try:
+                self._sync_timeslice(eq)
+                flux_average(field='psi', sim=eq, filename=self._h5_filename(eq),
+                             fcoords=fcoords, use_eq_fs=True, points=resolution,
+                             time=-1, units=self._map_units(units), coord='scalar')
+                fc = getattr(eq, 'fc', None)
+            except Exception as exc:
+                printwarn(f"Could not pre-compute the equilibrium flux coordinates: {exc}")
+                fc = None
+
+        if fc is not None:
+            try:
+                sim.fc = fc
+            except Exception as exc:
+                printwarn(f"Could not reuse the equilibrium flux coordinates: {exc}")
 
     # -----------------------------------------------------------------------
     # Metadata / inputs
@@ -423,6 +572,7 @@ class M3DC1Adapter(SimulationAdapter):
         try:
             sim = self._get_eq_sim()
             if sim is not None:
+                self._sync_timeslice(sim)
                 shape_dict = get_shape(sim, quiet=True)
                 globals_dict.update(shape_dict)
         except Exception as e:
@@ -440,9 +590,11 @@ class M3DC1Adapter(SimulationAdapter):
         if sim is None:
             return np.array([])
         m3dc1_units = self._map_units(units)
+        self._sync_timeslice(sim)
         try:
-            nflux, _ = flux_average(field='p', sim=sim, filename=sim.filename, fcoords=fcoords,
-                                    use_eq_fs=True, points=resolution, time=-1, units=m3dc1_units)
+            nflux, _ = flux_average(field='p', sim=sim, filename=self._h5_filename(sim),
+                                    fcoords=fcoords, use_eq_fs=True, points=resolution,
+                                    time=-1, units=m3dc1_units)
             return np.asarray(nflux)
         except Exception:
             return np.array([])
@@ -535,19 +687,31 @@ class M3DC1Adapter(SimulationAdapter):
             return np.array([]), np.array([])
 
         m3dc1_units = self._map_units(units)
+        h5_file     = self._h5_filename(sim)
+
+        # fusion-io's time slice option is global; make sure it matches 'sim'.
+        self._sync_timeslice(sim)
+
+        # Remote data: reuse the equilibrium flux coordinates instead of
+        # letting flux_average() rebuild them from the (unreadable) archive.
+        if self.is_campaign and time != -1 and use_eq_fs:
+            self._attach_equilibrium_fc(sim, resolution, units, fcoords)
+            self._sync_timeslice(sim)
 
         field_info = getattr(sim, 'typedict', getattr(sim, 'available_fields', {})).get(name, None)
         field_type = field_info[1] if field_info else 'scalar'
 
         try:
             if field_type == 'vector':
-                nflux, fR = flux_average(field=name, sim=sim, filename=sim.filename, fcoords=fcoords,
+                nflux, fR = flux_average(field=name, sim=sim, filename=h5_file, fcoords=fcoords,
                                          use_eq_fs=use_eq_fs, points=resolution, time=time,
                                          units=m3dc1_units, coord='R')
-                _, fPhi = flux_average(field=name, sim=sim, filename=sim.filename, fcoords=fcoords,
+                self._sync_timeslice(sim)
+                _, fPhi = flux_average(field=name, sim=sim, filename=h5_file, fcoords=fcoords,
                                        use_eq_fs=use_eq_fs, points=resolution, time=time,
                                        units=m3dc1_units, coord='phi')
-                _, fZ = flux_average(field=name, sim=sim, filename=sim.filename, fcoords=fcoords,
+                self._sync_timeslice(sim)
+                _, fZ = flux_average(field=name, sim=sim, filename=h5_file, fcoords=fcoords,
                                      use_eq_fs=use_eq_fs, points=resolution, time=time,
                                      units=m3dc1_units, coord='Z')
                 return np.asarray(nflux), {
@@ -556,13 +720,17 @@ class M3DC1Adapter(SimulationAdapter):
                     f"{name}_Z":   np.asarray(fZ)
                 }
             else:
-                nflux, fa = flux_average(field=name, sim=sim, filename=sim.filename, fcoords=fcoords,
+                nflux, fa = flux_average(field=name, sim=sim, filename=h5_file, fcoords=fcoords,
                                          use_eq_fs=use_eq_fs, points=resolution, time=time,
                                          units=m3dc1_units, coord='scalar')
                 return np.asarray(nflux), np.asarray(fa)
         except Exception as e:
             printerr(f"Error calculating flux average for {name}: {e}")
             return np.array([]), np.array([])
+        finally:
+            # flux_average() may have created (and destroyed) its own sim
+            # object, which resets fusion-io's global time slice.
+            self._sync_timeslice(sim)
 
     def get_time_trace(self, name, units):
         """
@@ -574,10 +742,11 @@ class M3DC1Adapter(SimulationAdapter):
             return np.array([]), np.array([])
 
         m3dc1_units = self._map_units(units)
+        self._sync_timeslice(sim)
 
         try:
             time_arr, values, label, unitlabel = get_timetrace(
-                trace=name, sim=sim, filename=sim.filename,
+                trace=name, sim=sim, filename=self._h5_filename(sim),
                 units=m3dc1_units, quiet=True, returnas='tuple'
             )
             return np.asarray(time_arr), np.asarray(values)
@@ -658,15 +827,15 @@ class M3DC1Adapter(SimulationAdapter):
             "simulation_time":       np.zeros(len(time_slices), dtype=float)
         }
 
-        c1_file = self._sim_filename()
-
         for i, ts in enumerate(time_slices):
             sim = self._get_eq_sim() if ts == -1 else self._get_time_sim(ts)
             if sim is None:
                 printwarn(f"Could not load simulation object for time slice {ts}; skipping.")
                 continue
 
-            h5file = sim._all_attrs
+            self._sync_timeslice(sim)
+            h5file  = sim._all_attrs
+            c1_file = self._h5_filename(sim)
 
             fname = "equilibrium.h5" if ts == -1 else f"time_{ts:03d}.h5"
 
@@ -679,6 +848,8 @@ class M3DC1Adapter(SimulationAdapter):
                 meta["simulation_time_step"][i] = int(readParameter('ntimestep', h5file=h5file))
             except Exception as e:
                 printerr(f"Error extracting ntimestep for slice {ts} from {fname}: {e}")
+
+            self._sync_timeslice(sim)
 
         return meta
 
@@ -806,6 +977,7 @@ class M3DC1Adapter(SimulationAdapter):
                 self._inner_wall_points = np.array([])
             else:
                 try:
+                    self._sync_timeslice(sim)
                     self._inner_wall_points = get_points_inside_inner_wall(sim=sim, quiet=True)
                 except Exception as e:
                     printerr(f"Error obtaining inner wall points: {e}")
@@ -825,18 +997,26 @@ class M3DC1Adapter(SimulationAdapter):
         Z   = points[:, 1]
         phi = np.zeros_like(R)
 
+        # The inner-wall lookup above may have touched the equilibrium sim, so
+        # re-assert the time slice of the object we are about to evaluate on.
+        self._sync_timeslice(sim)
+        time     = self._sim_time(sim)
+        filename = self._h5_filename(sim)
+
         field_info = getattr(sim, 'typedict', getattr(sim, 'available_fields', {})).get(field_name, None)
         field_type = field_info[1] if field_info else 'scalar'
 
         if field_type == 'vector':
-            vR, vPhi, vZ = eval_field(field_name, R, phi, Z, coord='vector', sim=sim, filename=sim.filename, quiet=False)
+            vR, vPhi, vZ = eval_field(field_name, R, phi, Z, coord='vector', sim=sim,
+                                      filename=filename, time=time, quiet=False)
             return {
                 f"{field_name}_R":   vR,
                 f"{field_name}_phi": vPhi,
                 f"{field_name}_Z":   vZ
             }
         else:
-            values = eval_field(field_name, R, phi, Z, coord='scalar', sim=sim, filename=sim.filename, quiet=False)
+            values = eval_field(field_name, R, phi, Z, coord='scalar', sim=sim,
+                                filename=filename, time=time, quiet=False)
             return values
 
     def _evaluate_rectangular_grid(self, field_name, grid_spec, sim, units, is_3d=False):
@@ -868,18 +1048,24 @@ class M3DC1Adapter(SimulationAdapter):
             Z   = Z.ravel()
             phi = np.zeros_like(R)
 
+        self._sync_timeslice(sim)
+        time     = self._sim_time(sim)
+        filename = self._h5_filename(sim)
+
         field_info = getattr(sim, 'typedict', getattr(sim, 'available_fields', {})).get(field_name, None)
         field_type = field_info[1] if field_info else 'scalar'
 
         if field_type == 'vector':
-            vR, vPhi, vZ = eval_field(field_name, R, phi, Z, coord='vector', sim=sim, filename=sim.filename, quiet=True)
+            vR, vPhi, vZ = eval_field(field_name, R, phi, Z, coord='vector', sim=sim,
+                                      filename=filename, time=time, quiet=True)
             return {
                 f"{field_name}_R":   vR,
                 f"{field_name}_phi": vPhi,
                 f"{field_name}_Z":   vZ
             }
         else:
-            values = eval_field(field_name, R, phi, Z, coord='scalar', sim=sim, filename=sim.filename, quiet=True)
+            values = eval_field(field_name, R, phi, Z, coord='scalar', sim=sim,
+                                filename=filename, time=time, quiet=True)
             return values
 
     def _evaluate_native_grid(self, field_name, sim, units):

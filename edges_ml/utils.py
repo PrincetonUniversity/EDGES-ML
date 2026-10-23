@@ -221,17 +221,42 @@ AVAILABLE_INPUTS        = ["Ip", "Bt"]
 # HELPERS & DATACLASSES
 # ===========================================================================
 
+_ALL_KEYWORDS = ("all", "*")
+
+
 def expand_request(selection, registry):
     """
     Helper function to parse the user's config request.
-    If they ask for "all", it returns everything in the registry.
-    If None, returns an empty list.
+
+    Accepted forms:
+        None            -> []                (nothing requested)
+        "all" / "*"     -> full registry
+        ["all"]         -> full registry     (a list containing the keyword)
+        ["p", "q", ...] -> the listed names
+
+    Returning the full registry for a list that merely *contains* the keyword
+    keeps configurations such as {"time_traces": ["all"]} working; previously
+    "all" was passed on as if it were the name of a quantity, which produced
+    errors like "Error extracting time trace all".
     """
     if selection is None:
         return []
-    if selection == "all":
-        return registry
-    return selection
+
+    if isinstance(selection, str):
+        if selection.strip().lower() in _ALL_KEYWORDS:
+            return list(registry)
+        return [selection]
+
+    try:
+        items = list(selection)
+    except TypeError:
+        return []
+
+    for item in items:
+        if isinstance(item, str) and item.strip().lower() in _ALL_KEYWORDS:
+            return list(registry)
+
+    return items
 
 
 @dataclass
