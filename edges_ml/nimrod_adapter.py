@@ -6,9 +6,25 @@ interface for NIMROD HDF5 dump files.
 
 External NIMROD tooling used here:
     nimpy.eval_nimrod.EvalNimrod / EvalGrid   -> point-wise field evaluation
+                                                 (eval_field: real space,
+                                                  eval_comp_field: per toroidal mode)
     nimpy.fsa.FSA / find_pf_null / FSAInput   -> flux surface averages, q, fluxes
     nimpy.read_bin.readBin                    -> discharge.bin / energy.bin traces
     nimrod2imas (dump2imas/input2imas/gamma2imas) -> IMAS conversion
+
+Mode perturbations
+------------------
+NIMROD stores the perturbation as complex Fourier coefficients c_n(R, Z) for
+each toroidal mode in 'keff'.  The physical perturbation is
+    f(R, phi, Z) = c_0 + sum_{n>0} 2 Re[c_n e^{i n phi}].
+Each toroidal mode in the dump becomes its own 'perturbations/nXX' entry
+(extract_mode_entries).  The coefficients are evaluated with
+EvalNimrod.eval_comp_field(), so single-n and multi-n runs are treated
+identically and no subtraction of two full fields is needed.
+
+Poloidal spectra (config key 'mode_spectra') are computed on flux-aligned
+(PEST / Boozer / Hamada) coordinates of the equilibrium, built by
+edges_ml.nimrod_fluxcoords (a port of M3D-C1's flux_coordinates()).
 """
 
 import os
@@ -50,12 +66,15 @@ except ImportError:
 _NIMPY_AVAILABLE = _NIMPY_EVAL_AVAILABLE
 
 from .base import SimulationAdapter
+from .nimrod_fluxcoords import build_flux_coordinates
 from .utils import (
     printwarn, printerr, printnote,
     compute_file_hash, auto_cast,
-    expand_request,
+    expand_request, brief_error,
+    spectrum_settings, poloidal_spectrum, parse_toroidal_mode_number,
     GridSpec,
     AVAILABLE_FLUX_AVERAGES,
+    AVAILABLE_1D_PROFILES, AVAILABLE_2D_FIELDS, AVAILABLE_3D_FIELDS,
     _infer_machine_and_shot, _allocate_imas_run, _imas_entry_dir,
     _prepare_nimrod2imas_runtime, _nimrod2imas_tool_available,
     _run_nimrod2imas_tool, _options_dict_to_cli,
@@ -100,6 +119,14 @@ def _trapz_profile(y, x):
     out = np.zeros_like(y)
     out[1:] = np.cumsum(0.5 * (y[1:] + y[:-1]) * np.diff(xx))
     return out
+
+
+def _points_signature(*arrays):
+    """Hash of one or more point arrays (used as a cache key)."""
+    h = hashlib.md5()
+    for a in arrays:
+        h.update(np.ascontiguousarray(a, dtype=float).tobytes())
+    return h.hexdigest()
 
 
 # ===========================================================================
@@ -198,6 +225,13 @@ class NIMRODAdapter(SimulationAdapter):
         self._global_params_cache = None
         self._warned_fields = set()
 
+        # Per-mode evaluation / spectrum caches
+        self._geometry_cache = {}
+        self._mode_table_cache = {}
+        self._comp_cache = {}
+        self._fluxcoord_cache = {}
+        self._fluxcoord_failed = set()
+
     # ======================================================================
     # CONFIG CAPTURE (so the adapter can size/limit the expensive FSA calls)
     # ======================================================================
@@ -226,6 +260,10 @@ class NIMRODAdapter(SimulationAdapter):
         self._fsa_cache.clear()
         self._axis_cache.clear()
         self._bin_cache.clear()
+        self._comp_cache.clear()
+        self._mode_table_cache.clear()
+        self._fluxcoord_cache.clear()
+        self._fluxcoord_failed.clear()
 
     # ======================================================================
     # MODE DIRECTORY / DUMP DISCOVERY  (unchanged behaviour)
@@ -700,13 +738,18 @@ class NIMRODAdapter(SimulationAdapter):
             printwarn(f"EvalGrid construction failed ({type(exc).__name__}: {exc}); using direct evaluation.")
             return None
 
-    def _eval_raw(self, ev, dump_file, nim_field, R, Z, phi, eq=2):
-        """Evaluates a nimpy field at the supplied points; returns (nqty, N) array."""
+    def _eval_raw(self, ev, dump_file, nim_field, R, Z, phi, eq=2, use_grid=True):
+        """
+        Evaluates a nimpy field at the supplied points; returns (nqty, N) array.
+
+        use_grid=False skips the EvalGrid logical-mapping cache; this is
+        cheaper for point sets that are evaluated only once.
+        """
         rzp = np.array([np.asarray(R, dtype=float).ravel(),
                         np.asarray(Z, dtype=float).ravel(),
                         np.asarray(phi, dtype=float).ravel()])
 
-        grid = self._get_eval_grid(ev, dump_file, rzp, nim_field)
+        grid = self._get_eval_grid(ev, dump_file, rzp, nim_field) if use_grid else None
 
         with _pushd(Path(dump_file).resolve().parent):
             if grid is not None:
@@ -715,6 +758,40 @@ class NIMRODAdapter(SimulationAdapter):
                 except Exception:
                     pass
             return ev.eval_field(nim_field, rzp, dmode=0, eq=eq)
+
+    def _eval_comp_raw(self, ev, dump_file, nim_field, R, Z):
+        """
+        Per-toroidal-mode evaluation with EvalNimrod.eval_comp_field.
+
+        Returns a complex array of shape (nqty, nmodes, N).  Results are cached
+        per (dump, field, point set), so all toroidal modes (and repeated
+        requests) reuse a single evaluation pass.
+        """
+        R = np.asarray(R, dtype=float).ravel()
+        Z = np.asarray(Z, dtype=float).ravel()
+        key = (str(Path(dump_file).resolve()), nim_field, _points_signature(R, Z))
+        if key in self._comp_cache:
+            return self._comp_cache[key]
+
+        # Always pass a (3, N) array; eval_comp_field ignores phi.
+        rzp = np.array([R, Z, np.zeros_like(R)])
+        grid = self._get_eval_grid(ev, dump_file, rzp, nim_field)
+
+        res = None
+        with _pushd(Path(dump_file).resolve().parent):
+            if grid is not None:
+                try:
+                    res = ev.eval_comp_field(nim_field, grid, dmode=0)
+                except Exception:
+                    res = None
+            if res is None:
+                res = ev.eval_comp_field(nim_field, rzp, dmode=0)
+
+        res = np.asarray(res)
+        # (nqty, nmodes, nderiv, N) -> (nqty, nmodes, N)
+        res = res[:, :, 0, ...].reshape(res.shape[0], res.shape[1], -1)
+        self._comp_cache[key] = res
+        return res
 
     def _warn_field_once(self, name, message):
         if name not in self._warned_fields:
@@ -756,6 +833,13 @@ class NIMRODAdapter(SimulationAdapter):
             return payload
         return None
 
+    def _species_index(self, ev, idx):
+        if idx == 'electron':
+            return 0
+        if idx == 'ion':
+            return self._ion_index(ev)
+        return int(idx)
+
     def _evaluate_field_at_points(self, name, R, Z, phi, dump_file, eq=2):
         """
         Evaluates an edges-ml field name at arbitrary (R, Z, phi) points.
@@ -788,13 +872,7 @@ class NIMRODAdapter(SimulationAdapter):
                 nim_field, idx = payload
                 res = self._eval_raw(ev, dump_file, nim_field, R, Z, phi, eq=eq)
                 res = np.atleast_2d(np.asarray(res))
-                if idx == 'electron':
-                    k = 0
-                elif idx == 'ion':
-                    k = self._ion_index(ev)
-                else:
-                    k = int(idx)
-                k = min(k, res.shape[0] - 1)
+                k = min(self._species_index(ev, idx), res.shape[0] - 1)
                 return res[k]
 
             # vector
@@ -816,6 +894,481 @@ class NIMRODAdapter(SimulationAdapter):
                 name, f"Error evaluating NIMROD field '{name}': {type(exc).__name__}: {exc}"
             )
             return np.array([])
+
+    # ======================================================================
+    # PER-MODE (COMPLEX) EVALUATION
+    # ======================================================================
+
+    def _geometry(self, dump_file):
+        """
+        Returns (torgeom, per_length) for the run that produced *dump_file*,
+        read from the nimrod.in next to it.
+        """
+        d = Path(dump_file).resolve().parent
+        if d in self._geometry_cache:
+            return self._geometry_cache[d]
+
+        geom, per_length = "tor", 1.0
+        found = False
+        try:
+            import f90nml
+            nml = f90nml.read(str(d / "nimrod.in"))
+            gi = nml.get('grid_input', {}) or {}
+            geom = str(gi.get('geom', 'tor')).strip().lower()
+            per_length = float(gi.get('per_length', 1.0))
+            found = True
+        except Exception:
+            pass
+        if not found:
+            try:
+                import nimpy.util.nimrodin as nimrodin_mod
+                with _pushd(d):
+                    nin = nimrodin_mod.NimrodIn()
+                    geom = str(nin['geom']).strip().lower()
+                    per_length = float(nin['per_length'])
+            except Exception:
+                printwarn(f"Could not read geometry from {d / 'nimrod.in'}; "
+                          "assuming toroidal geometry.")
+
+        result = (geom.startswith('tor'), per_length)
+        self._geometry_cache[d] = result
+        return result
+
+    def _mode_table(self, dump_file):
+        """
+        List of (mode_index, n) for the toroidal modes stored in *dump_file*.
+
+        The mode index addresses the mode axis returned by eval_comp_field,
+        which is assumed to follow the order of 'keff' in the dump.  For 'lin'
+        geometry keff is converted to a mode index (keff * per_length / 2 pi).
+        """
+        if dump_file is None:
+            return []
+        key = str(Path(dump_file).resolve())
+        if key in self._mode_table_cache:
+            return self._mode_table_cache[key]
+
+        table = []
+        try:
+            with h5py.File(dump_file, 'r') as h5:
+                keff = np.asarray(h5['keff'][()], dtype=float).ravel()
+        except Exception as exc:
+            printwarn(f"Could not read keff from {Path(dump_file).name}: {exc}")
+            self._mode_table_cache[key] = table
+            return table
+
+        torgeom, per_length = self._geometry(dump_file)
+        if not torgeom:
+            keff = keff * per_length / (2.0 * np.pi)
+
+        n_vals = [int(round(k)) for k in keff]
+
+        ev = self._get_eval(dump_file)
+        nmodes_peq = None
+        if ev is not None:
+            try:
+                nmodes_peq = int(getattr(ev, 'nmodes_peq'))
+            except Exception:
+                nmodes_peq = None
+        if nmodes_peq is not None and nmodes_peq != len(n_vals):
+            nuse = min(nmodes_peq, len(n_vals))
+            printwarn(
+                f"NIMROD: dump keff has {len(n_vals)} modes but nimpy reports "
+                f"nmodes_peq={nmodes_peq} for {Path(dump_file).name}; using the "
+                f"first {nuse} modes."
+            )
+            n_vals = n_vals[:nuse]
+
+        table = list(enumerate(n_vals))
+        self._mode_table_cache[key] = table
+        return table
+
+    def _mode_coefficients(self, name, R, Z, dump_file):
+        """
+        Complex Fourier coefficients of an edges-ml field at (R, Z) points.
+
+        Returns {key: complex array [nmodes, N]} with key = name for scalars
+        and name_R / name_Z / name_phi for vectors (phi component multiplied
+        by PHI_SIGN_FLIP).  The coefficients follow NIMROD's convention:
+            field(phi_nimrod) = 2 Re[c e^{i n phi_nimrod}]   (n > 0).
+        """
+        kind, payload = self._resolve_field(name)
+        if kind is None:
+            self._warn_field_once(
+                name, f"Field '{name}' is not available from NIMROD dumps; skipping."
+            )
+            return {}
+
+        ev = self._get_eval(dump_file)
+        if ev is None:
+            return {}
+
+        try:
+            if kind == 'derived':
+                total_name, sub_name = payload
+                a = self._mode_coefficients(total_name, R, Z, dump_file)
+                b = self._mode_coefficients(sub_name, R, Z, dump_file)
+                if total_name not in a or sub_name not in b:
+                    return {}
+                return {name: a[total_name] - b[sub_name]}
+
+            if kind == 'scalar':
+                nim_field, idx = payload
+                res = self._eval_comp_raw(ev, dump_file, nim_field, R, Z)
+                k = min(self._species_index(ev, idx), res.shape[0] - 1)
+                return {name: res[k]}
+
+            nim_field = payload
+            res = self._eval_comp_raw(ev, dump_file, nim_field, R, Z)
+            if res.shape[0] < 3:
+                self._warn_field_once(
+                    f"comp::{name}",
+                    f"Field '{name}' did not return 3 complex components from NIMROD; skipping."
+                )
+                return {}
+            return {
+                f"{name}_R":   res[0],
+                f"{name}_Z":   res[1],
+                f"{name}_phi": self.PHI_SIGN_FLIP * res[2],
+            }
+        except Exception as exc:
+            self._warn_field_once(
+                f"comp::{name}",
+                f"Error evaluating NIMROD per-mode field '{name}': {brief_error(exc)}"
+            )
+            return {}
+
+    def _mode_fields_on_grid(self, name, grid_spec, dump_file, imode, n, is_3d,
+                             store_complex):
+        """
+        Physical perturbation of toroidal mode n on a 2D/3D output grid:
+            2 Re[c_n e^{i n phi}]  (n > 0),   Re[c_0]  (n = 0),
+        with phi the grid's toroidal angle (NIMROD convention, as used for the
+        equilibrium 3D fields; phi = 0 for 2D grids).  Each unique (R, Z) point
+        is evaluated once; the phi dependence is reconstructed analytically.
+        """
+        if is_3d:
+            R, phi, Z = self._grid_points_3d(grid_spec, time=-1)
+        else:
+            R, Z = self._grid_points_2d(grid_spec, time=-1)
+            phi = np.zeros_like(R)
+        if R.size == 0:
+            return np.array([])
+
+        rz = np.column_stack((R, Z))
+        uniq, inv = np.unique(rz, axis=0, return_inverse=True)
+        inv = np.asarray(inv).ravel()
+
+        coeffs = self._mode_coefficients(name, uniq[:, 0], uniq[:, 1], dump_file)
+        if not coeffs:
+            return np.array([])
+
+        out = {}
+        phase = np.exp(1j * n * phi) if n != 0 else None
+        for key, arr in coeffs.items():
+            arr = np.asarray(arr)
+            if imode >= arr.shape[0]:
+                return np.array([])
+            c = arr[imode][inv].astype(np.complex128)
+            if n == 0:
+                out[key] = np.real(c)
+            else:
+                out[key] = 2.0 * np.real(c * phase)
+            if store_complex:
+                out[f"{key}_re"] = np.real(c)
+                out[f"{key}_im"] = np.imag(c)
+
+        if list(out.keys()) == [name]:
+            return out[name]
+        return out
+
+    # ======================================================================
+    # PER-MODE ENTRIES (one perturbation group per toroidal mode)
+    # ======================================================================
+
+    def extract_mode_entries(self, mode_dir, config):
+        """
+        One perturbation entry per toroidal mode stored in the final dump of
+        the mode directory.  Works identically for single-n and multi-n runs.
+
+        Falls back to the legacy behaviour (summed perturbation from
+        extract_mode() + get_all_mode_entries()) if the mode table cannot be
+        determined.
+        """
+        self._config = config or {}
+        mode_dir = Path(mode_dir)
+        dump_file = self._last_dump_in_dir(mode_dir)
+        table = self._mode_table(dump_file) if (dump_file and _NIMPY_EVAL_AVAILABLE) else []
+
+        if not table:
+            printwarn(f"NIMROD: could not determine the toroidal modes of {mode_dir}; "
+                      "falling back to the legacy (summed) perturbation output.")
+            return super().extract_mode_entries(mode_dir, config)
+
+        include_n0 = bool(self._config.get("nimrod_include_n0_mode", False))
+        growth = self._get_nimgrowth_for_dir(mode_dir)
+
+        # 1D profiles describe the directory (not a single mode); compute once.
+        res_1d = self._config.get("resolutions", {}).get("1d", 200)
+        units = self._config.get("units", "codeunits")
+        profiles = {}
+        for field in expand_request(self._config.get("mode_1d_profiles"), AVAILABLE_1D_PROFILES):
+            profiles[field] = self.get_mode_1d_profile(mode_dir, field, res_1d, units)
+
+        entries = []
+        for imode, n in table:
+            if n == 0 and not include_n0 and len(table) > 1:
+                continue
+            if growth and n not in growth:
+                printwarn(f"Toroidal mode n={n} of {mode_dir.name} not found in nimgrowth output.")
+            meta = {
+                "growth_rate": float(growth.get(n, 0.0)),
+                "frequency":   0.0,
+                "mode_type":   -100,
+            }
+            data = self._extract_single_mode(mode_dir, dump_file, imode, n, meta, profiles)
+            entries.append((f"n{n:02d}", meta, data))
+
+        if not entries:
+            printwarn(f"NIMROD: no toroidal modes selected in {mode_dir} "
+                      "(only n=0 present; set nimrod_include_n0_mode to export it).")
+        return entries
+
+    def _extract_single_mode(self, mode_dir, dump_file, imode, n, meta, profiles):
+        """Mode data (2D/3D fields and spectra) for a single toroidal mode."""
+        cfg = self._config or {}
+        data = {
+            "mode_information": dict(meta),
+            "1d_profiles": dict(profiles),
+            "2d_fields": {},
+            "3d_fields": {},
+        }
+        store_complex = bool(cfg.get("nimrod_store_complex", False))
+
+        grid_2d = cfg.get("perturbation_2d_grid", cfg.get("2d_grid", GridSpec("rectangular", (128, 128))))
+        for field in expand_request(cfg.get("mode_2d_fields"), AVAILABLE_2D_FIELDS):
+            val = self._mode_fields_on_grid(field, grid_2d, dump_file, imode, n, False, store_complex)
+            if isinstance(val, dict):
+                data["2d_fields"].update(val)
+            else:
+                data["2d_fields"][field] = val
+
+        grid_3d = cfg.get("perturbation_3d_grid", cfg.get("3d_grid", GridSpec("rectangular", (64, 16, 64))))
+        for field in expand_request(cfg.get("mode_3d_fields"), AVAILABLE_3D_FIELDS):
+            val = self._mode_fields_on_grid(field, grid_3d, dump_file, imode, n, True, store_complex)
+            if isinstance(val, dict):
+                data["3d_fields"].update(val)
+            else:
+                data["3d_fields"][field] = val
+
+        settings = spectrum_settings(cfg)
+        spectra = {}
+        for field in settings["fields"]:
+            try:
+                res = self.get_mode_spectrum(mode_dir, field, settings, n=n, imode=imode)
+            except Exception as exc:
+                printerr(f"Poloidal spectrum of '{field}' (n={n}) failed for {mode_dir}: "
+                         f"{brief_error(exc)}")
+                res = {}
+            if res:
+                spectra[field] = res
+        if spectra:
+            data["spectra"] = spectra
+
+        return data
+
+    # ======================================================================
+    # POLOIDAL SPECTRA
+    # ======================================================================
+
+    def _get_flux_coordinates(self, dump_file, settings):
+        """
+        Flux-aligned coordinates of the equilibrium (eq=1 field), cached per
+        model (all mode directories of a model share the equilibrium).  The
+        dump that is evaluated anyway is used, so the single-file nimpy
+        library does not have to switch files.
+        """
+        cfg = self._config or {}
+        points = int(settings["points"])
+        fcoords = settings["fcoords"]
+        oversample = int(settings["theta_oversample"])
+        ray_samples = int(cfg.get("nimrod_psi_ray_samples", 4 * points))
+        include_omega = bool(settings["include_omega"])
+        key = (points, fcoords, oversample, ray_samples, include_omega)
+
+        if key in self._fluxcoord_cache:
+            return self._fluxcoord_cache[key]
+        if key in self._fluxcoord_failed:
+            return None
+
+        ev = self._get_eval(dump_file)
+        if ev is None:
+            self._fluxcoord_failed.add(key)
+            return None
+
+        try:
+            axis = self._find_magnetic_axis(ev, dump_file)
+            bbox = self._get_bounding_box(-1)
+            torgeom, per_length = self._geometry(dump_file)
+            period = 2.0 * np.pi if torgeom else per_length
+
+            def eval_b(R, Z):
+                R = np.asarray(R, dtype=float).ravel()
+                Z = np.asarray(Z, dtype=float).ravel()
+                res = np.atleast_2d(np.asarray(
+                    self._eval_raw(ev, dump_file, 'b', R, Z, np.zeros_like(R),
+                                   eq=1, use_grid=False)))
+                return res[0], res[1], self.PHI_SIGN_FLIP * res[2]
+
+            find_null = None
+            if _NIMPY_FSA_AVAILABLE:
+                def find_null(guess):
+                    try:
+                        with _pushd(Path(dump_file).resolve().parent):
+                            return np.asarray(find_pf_null(
+                                ev, [float(guess[0]), float(guess[1]), 0.0], addpert=False))
+                    except Exception:
+                        return None
+
+            guesses = []
+            raw_guess = cfg.get("nimrod_xpoint_guess", None)
+            if raw_guess is not None:
+                arr = np.atleast_2d(np.asarray(raw_guess, dtype=float))
+                if arr.shape[1] >= 2:
+                    guesses = [list(row[:2]) for row in arr]
+
+            fc = build_flux_coordinates(
+                eval_b, axis, bbox, points,
+                fcoords=fcoords, torgeom=torgeom, period=period,
+                find_null=find_null, xpoint_guesses=guesses,
+                psi_lcfs=cfg.get("nimrod_psi_lcfs", None),
+                ray_samples=ray_samples, theta_oversample=oversample,
+                include_omega=include_omega, verbose=True,
+            )
+        except Exception as exc:
+            printerr(f"NIMROD flux coordinates failed for {Path(dump_file).name}: "
+                     f"{brief_error(exc)}")
+            self._fluxcoord_failed.add(key)
+            return None
+
+        self._fluxcoord_cache[key] = fc
+        return fc
+
+    def _select_mode(self, table, mode_dir, n, imode):
+        """Resolves (mode index, n) from the mode table."""
+        if imode is not None and n is not None:
+            return imode, n
+        if n is not None:
+            for i, nn in table:
+                if nn == n:
+                    return i, nn
+            return None, n
+        if len(table) == 1:
+            return table[0]
+        guess = parse_toroidal_mode_number(Path(mode_dir).name)
+        if guess is not None:
+            for i, nn in table:
+                if nn == guess:
+                    return i, nn
+        return None, None
+
+    def get_mode_spectrum(self, mode_dir, field, settings, n=None, imode=None):
+        """
+        Poloidal Fourier spectrum of toroidal mode n of *field* on flux-aligned
+        coordinates of the equilibrium.
+
+        The real eigenfunction in the M3D-C1 toroidal-angle convention is
+            g(theta, psi) = 2 Re[conj(c_n) e^{i n phi}],  phi = zeta_t (- omega)
+        where conj() converts NIMROD's toroidal angle direction to M3D-C1's and
+        omega is only applied for Boozer / Hamada if spectrum_include_omega.
+        The spectrum is |rfft(g, axis=0, norm='forward')|, as in M3D-C1.
+        """
+        if not _NIMPY_EVAL_AVAILABLE:
+            return {}
+
+        dump_file = self._last_dump_in_dir(mode_dir)
+        if dump_file is None:
+            return {}
+
+        table = self._mode_table(dump_file)
+        if not table:
+            return {}
+        imode, n = self._select_mode(table, mode_dir, n, imode)
+        if imode is None:
+            self._warn_field_once(
+                f"spec_mode::{mode_dir}::{n}",
+                f"Toroidal mode n={n} not found in {Path(dump_file).name}; no spectrum."
+            )
+            return {}
+
+        kind, _ = self._resolve_field(field)
+        if kind not in ('scalar', 'derived'):
+            self._warn_field_once(
+                f"spec_vec::{field}",
+                f"Poloidal spectra of non-scalar field '{field}' are not supported yet; skipping."
+            )
+            return {}
+
+        fc = self._get_flux_coordinates(dump_file, settings)
+        if fc is None:
+            return {}
+
+        shape = fc.rpath.shape
+        coeffs = self._mode_coefficients(field, fc.rpath.ravel(), fc.zpath.ravel(), dump_file)
+        if field not in coeffs:
+            return {}
+        arr = np.asarray(coeffs[field])
+        if imode >= arr.shape[0]:
+            return {}
+        c = arr[imode].reshape(shape).astype(np.complex128)
+
+        n_bad = int(np.count_nonzero(~np.isfinite(c)))
+        if n_bad:
+            printwarn(f"NIMROD spectrum '{field}' n={n}: {n_bad} flux-grid points could "
+                      "not be evaluated; affected surfaces will contain NaN.")
+
+        F = np.conj(c)
+        phit = float(settings["phi"])
+        apply_omega = bool(settings["include_omega"]) and fc.omega is not None
+        if n == 0:
+            ef = np.real(F)
+        else:
+            phi = np.full(shape, phit)
+            if apply_omega:
+                phi = phi - fc.omega
+            ef = 2.0 * np.real(F * np.exp(1j * n * phi))
+
+        amplitude, m = poloidal_spectrum(ef)
+
+        out = {
+            "psi_norm":  np.asarray(fc.psi_norm, dtype=float),
+            "m":         m,
+            "amplitude": amplitude,
+            "q":         np.asarray(fc.q, dtype=float),
+            "_attrs": {
+                "code":             self.CODE_NAME,
+                "field":            str(field),
+                "n":                int(n),
+                "fcoords":          fc.fcoords,
+                "phi":              phit,
+                "toroidal_angle":   "zeta" if apply_omega else "geometric_phi",
+                "points":           int(settings["points"]),
+                "normalization":    "rfft_forward_abs",
+                "theta_convention": "theta=0 outboard midplane, clockwise in (R,Z)",
+                "psi_lcfs_source":  str(fc.lcfs_source),
+                "psi_lcfs":         float(fc.psi_lcfs),
+                "n_clipped":        int(fc.n_clipped),
+                "n_unreached":      int(fc.n_unreached),
+            },
+        }
+        if settings.get("store_fluxgrid"):
+            out["eigenfunction"] = ef
+            out["R"] = np.asarray(fc.rpath, dtype=float)
+            out["Z"] = np.asarray(fc.zpath, dtype=float)
+            out["theta"] = np.asarray(fc.theta, dtype=float)
+            if fc.omega is not None:
+                out["omega"] = np.asarray(fc.omega, dtype=float)
+        return out
 
     # ======================================================================
     # GEOMETRY / GRIDS
@@ -1010,7 +1563,10 @@ class NIMRODAdapter(SimulationAdapter):
         return self.get_3d_mesh(grid_spec)
 
     def get_mode_2d_field(self, mode_dir, name, grid_spec, units):
-        """Evaluates the field at the final dump of the given mode directory."""
+        """
+        Evaluates the field at the final dump of the given mode directory.
+        Only used by the legacy fallback path of extract_mode_entries().
+        """
         dump_file = self._last_dump_in_dir(mode_dir)
         if dump_file is None:
             printwarn(f"No dump files found in mode directory {mode_dir}.")
@@ -1022,7 +1578,10 @@ class NIMRODAdapter(SimulationAdapter):
         return self._evaluate_field_at_points(name, R, Z, phi, dump_file, eq=2)
 
     def get_mode_3d_field(self, mode_dir, name, grid_spec, units):
-        """Evaluates the field at the final dump of the given mode directory."""
+        """
+        Evaluates the field at the final dump of the given mode directory.
+        Only used by the legacy fallback path of extract_mode_entries().
+        """
         dump_file = self._last_dump_in_dir(mode_dir)
         if dump_file is None:
             printwarn(f"No dump files found in mode directory {mode_dir}.")
@@ -1801,6 +2360,7 @@ class NIMRODAdapter(SimulationAdapter):
         """
         Extracts the growth rate for the toroidal mode number corresponding to this
         mode directory by running 'nimgrowth energy.bin'.
+        Used by the legacy fallback path of extract_mode_entries().
         """
         meta = {
             "growth_rate": 0.0,
@@ -1828,8 +2388,9 @@ class NIMRODAdapter(SimulationAdapter):
 
     def get_all_mode_entries(self, mode_dir, config):
         """
-        Overrides the base class method to expand a single NIMROD mode directory
-        into one perturbation group per toroidal mode number found in the nimgrowth output.
+        Expands a single NIMROD mode directory into one perturbation group per
+        toroidal mode number found in the nimgrowth output.
+        Used by the legacy fallback path of extract_mode_entries().
         """
         growth_rates = self._get_nimgrowth_for_dir(mode_dir)
 
