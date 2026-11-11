@@ -10,6 +10,9 @@ from .utils import (
     printwarn, printerr,
     GridSpec,
     expand_request,
+    brief_error,
+    spectrum_settings,
+    parse_toroidal_mode_number,
     _subtract_field_results,
     AVAILABLE_1D_PROFILES,
     AVAILABLE_2D_FIELDS,
@@ -107,6 +110,37 @@ class SimulationAdapter:
         self._warn_unimplemented('get_mode_3d_field')
         return np.array([])
 
+    def get_mode_spectrum(self, mode_dir, field, settings, n=None):
+        """
+        Poloidal Fourier spectrum of the mode perturbation of *field* on
+        flux-aligned coordinates.
+
+        Parameters
+        ----------
+        mode_dir : Path
+            Mode directory (or campaign simulation path).
+        field : str
+            edges-ml field name (see utils.AVAILABLE_SPECTRUM_FIELDS).
+        settings : dict
+            Output of utils.spectrum_settings(config).
+        n : int, optional
+            Toroidal mode number.
+
+        Returns
+        -------
+        dict
+            {
+              "psi_norm":  [n_psi],
+              "m":         [n_m],
+              "amplitude": [n_m, n_psi],
+              (optional) "q", "eigenfunction", "R", "Z", "theta", ...,
+              "_attrs":    {...}   # written as group attributes
+            }
+            or {} if not available.
+        """
+        self._warn_unimplemented('get_mode_spectrum')
+        return {}
+
     def get_time_metadata(self, time_slices):
         self._warn_unimplemented('get_time_metadata')
         return {
@@ -125,6 +159,21 @@ class SimulationAdapter:
         the 'perturbations' group for a given mode directory.
         """
         return [(mode_dir.name, self.get_mode_metadata(mode_dir))]
+
+    def extract_mode_entries(self, mode_dir, config):
+        """
+        Returns a list of (entry_name, entry_metadata, mode_data) tuples for a
+        mode directory.
+
+        The default implementation reproduces the historical behaviour: the
+        mode data are extracted once and shared by every entry returned by
+        get_all_mode_entries().  Adapters that resolve several toroidal modes
+        per directory (e.g. NIMROD multi-n runs) override this method to
+        return per-mode data.
+        """
+        mode_data = self.extract_mode(mode_dir, config)
+        entries   = self.get_all_mode_entries(mode_dir, config)
+        return [(name, meta, mode_data) for name, meta in entries]
 
     def close(self):
         pass
@@ -276,6 +325,32 @@ class SimulationAdapter:
 
         return data
 
+    def _extract_mode_spectra(self, mode_dir, config, n=None):
+        """
+        Computes the poloidal spectra requested by config['mode_spectra'].
+
+        Returns {field: spectrum_dict} or {} when the feature is not requested
+        (the default), so existing configurations are not affected.
+        """
+        settings = spectrum_settings(config)
+        if not settings["fields"]:
+            return {}
+
+        if n is None:
+            n = parse_toroidal_mode_number(Path(mode_dir).name)
+
+        spectra = {}
+        for field in settings["fields"]:
+            try:
+                res = self.get_mode_spectrum(mode_dir, field, settings, n=n)
+            except Exception as exc:
+                printerr(f"Poloidal spectrum of '{field}' failed for {mode_dir}: "
+                         f"{brief_error(exc)}")
+                res = {}
+            if res:
+                spectra[field] = res
+        return spectra
+
     def extract_mode(self, mode_dir, config):
         """
         Extracts the mode-specific perturbation data (eigenfunction).
@@ -313,5 +388,12 @@ class SimulationAdapter:
                 data["3d_fields"].update(val)
             else:
                 data["3d_fields"][field] = val
+
+        # Poloidal spectra are only added when explicitly requested
+        # (config['mode_spectra']), so the output of existing configurations
+        # is unchanged.
+        spectra = self._extract_mode_spectra(mode_dir, config)
+        if spectra:
+            data["spectra"] = spectra
 
         return data
