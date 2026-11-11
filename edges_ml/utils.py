@@ -342,6 +342,11 @@ AVAILABLE_FLUX_AVERAGES = list(FLUX_AVERAGE_LABELS.keys())
 AVAILABLE_TIME_TRACES   = list(TIME_TRACE_LABELS.keys())
 AVAILABLE_INPUTS        = ["Ip", "Bt"]
 
+# Fields for which a poloidal Fourier spectrum of the mode perturbation can be
+# exported (config key 'mode_spectra').  Only scalar fields are supported for
+# now; vector fields (B, v, ...) are reserved for a future extension.
+AVAILABLE_SPECTRUM_FIELDS = ["p"]
+
 
 # ===========================================================================
 # HELPERS & DATACLASSES
@@ -485,6 +490,107 @@ def _subtract_field_results(val_finite, val_eq):
             return np.asarray(val_finite) - np.asarray(val_eq)
         except Exception:
             return np.array([])
+
+
+# ===========================================================================
+# MODE SPECTRUM HELPERS (shared by all adapters)
+# ===========================================================================
+
+_FCOORDS_ALIASES = {
+    "": "geometric",
+    "geo": "geometric",
+    "geometric": "geometric",
+    "geometrical": "geometric",
+    "none": "geometric",
+    "pest": "pest",
+    "boozer": "boozer",
+    "hamada": "hamada",
+    "canonical": "canonical",
+}
+
+
+def normalize_fcoords(fcoords):
+    """
+    Maps a user supplied flux coordinate name onto one of
+        'pest', 'boozer', 'hamada', 'canonical', 'geometric'.
+
+    None defaults to 'pest'.  An empty string selects the geometric angle (the
+    same convention as M3D-C1's flux_coordinates()).
+    """
+    if fcoords is None:
+        return "pest"
+    key = str(fcoords).strip().lower()
+    if key in _FCOORDS_ALIASES:
+        return _FCOORDS_ALIASES[key]
+    printwarn(f"Unknown flux coordinate system '{fcoords}'; using 'pest'.")
+    return "pest"
+
+
+def spectrum_settings(config):
+    """
+    Collects all poloidal-spectrum related configuration options.
+
+    The spectrum feature is OFF unless config['mode_spectra'] is set.
+    """
+    cfg = config or {}
+    fields = expand_request(cfg.get("mode_spectra"), AVAILABLE_SPECTRUM_FIELDS)
+    fc_raw = cfg.get("spectrum_fcoords", cfg.get("fcoords", "pest"))
+    return {
+        "fields":           list(fields),
+        "points":           int(cfg.get("spectrum_points", 200)),
+        "fcoords":          normalize_fcoords(fc_raw),
+        "phi":              float(cfg.get("spectrum_phi", 0.0)),
+        "include_omega":    bool(cfg.get("spectrum_include_omega", False)),
+        "store_fluxgrid":   bool(cfg.get("spectrum_store_fluxgrid", False)),
+        "theta_oversample": max(1, int(cfg.get("spectrum_theta_oversample", 1))),
+        "units":            str(cfg.get("units", "codeunits")),
+    }
+
+
+def poloidal_spectrum(ef):
+    """
+    Poloidal Fourier spectrum of a real field given on a uniform poloidal grid.
+
+    Parameters
+    ----------
+    ef : array [n_theta, n_psi]
+        Real field values, theta = 2*pi*arange(n_theta)/n_theta (no duplicate
+        end point), one column per flux surface.
+
+    Returns
+    -------
+    amplitude : array [n_m, n_psi]
+        |rfft(ef, axis=0, norm='forward')|, identical to the operation used in
+        m3dc1.eigenfunction.eigenfunction().
+    m : array [n_m]
+        Poloidal mode numbers 0 ... n_theta//2.
+    """
+    ef = np.asarray(ef, dtype=float)
+    if ef.ndim == 1:
+        ef = ef[:, None]
+    try:
+        from scipy.fft import rfft as _rfft
+        spec = _rfft(ef, axis=0, norm='forward')
+    except Exception:
+        spec = np.fft.rfft(ef, axis=0, norm='forward')
+    amplitude = np.abs(spec)
+    m = np.arange(amplitude.shape[0], dtype=int)
+    return amplitude, m
+
+
+def parse_toroidal_mode_number(name):
+    """
+    Extracts the toroidal mode number from a directory / entry name such as
+    'n5', 'n05' or 'n05_restart'.  Returns None if no number can be found.
+    """
+    s = str(name).strip()
+    m = re.fullmatch(r'n(\d+)', s)
+    if m:
+        return int(m.group(1))
+    m = re.match(r'^n(\d+)', s)
+    if m:
+        return int(m.group(1))
+    return None
 
 
 # ===========================================================================
