@@ -18,6 +18,10 @@ Notes
   conversion on the remote host instead.
 * Slurm logs, C1input namelists and gamma files are not part of the campaign
   archive, so 'inputs' stays empty and the growth rates default to 0.
+* Poloidal mode spectra ('mode_spectra') rely on m3dc1's flux_coordinates()
+  working with the streamed data. If it fails for a model, the spectra of that
+  model are skipped with an error message; all other output is still written.
+  The toroidal mode number is taken from the simulation path (e.g. '.../n40').
 """
 
 import edges_ml
@@ -50,6 +54,14 @@ config = {
     "mode_1d_profiles": [],
     "mode_2d_fields": ["p"],
     "mode_3d_fields": [],
+
+    # Poloidal Fourier spectra of the mode eigenfunctions.
+    # A lower resolution reduces the amount of streamed data.
+    "mode_spectra": ["p"],             # currently only 'p' is supported
+    "spectrum_fcoords": "pest",        # 'pest' (default), 'boozer', 'hamada'; '' = geometric (fallback only)
+    "spectrum_points": 128,            # number of theta AND psi points
+    "spectrum_phi": 0.0,               # toroidal angle at which the eigenfunction is evaluated
+    "spectrum_store_fluxgrid": False,  # set True to also store eigenfunction[theta, psi], R, Z
 
     # Grid Specifications
     "shared_grid_source": "first", # Options: 'first', '/path/to/simulation', or None

@@ -28,6 +28,15 @@ config = {
     "mode_1d_profiles": [],
     "mode_2d_fields": ["B"],
     "mode_3d_fields": [],
+
+    # Poloidal Fourier spectra of the mode eigenfunctions
+    # (same algorithm as m3dc1.eigenfunction.eigenfunction(fourier=True)).
+    # Written to /perturbations/<nXX>/spectra/<field>/. Omit 'mode_spectra' to disable.
+    "mode_spectra": ["p"],             # currently only 'p' is supported
+    "spectrum_fcoords": "pest",        # 'pest' (default), 'boozer', 'hamada'; '' = geometric (fallback only)
+    "spectrum_points": 200,            # number of theta AND psi points
+    "spectrum_phi": 0.0,               # toroidal angle at which the eigenfunction is evaluated
+    "spectrum_store_fluxgrid": True,   # also store eigenfunction[theta, psi], R, Z, theta
     
     # Grid Specifications
     "shared_grid_source": "first", # Options: 'first', '/path/to/simulation', or None

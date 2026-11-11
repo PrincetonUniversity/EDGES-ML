@@ -24,10 +24,31 @@ config = {
     "total_2d_fields": ["B", "ne", "te"],
     "total_3d_fields": [],
 
-    # Choose perturbed quantities to export (mode structure)
+    # Choose perturbed quantities to export (mode structure).
+    # NIMROD writes one /perturbations/nXX entry per toroidal mode stored in the
+    # dump (single-n and multi-n runs). The fields are the physical perturbation
+    # of that mode, 2 Re[c_n exp(i n phi)], evaluated per mode (no subtraction).
     "mode_1d_profiles": [],
     "mode_2d_fields": ["B", "p"],
     "mode_3d_fields": [],
+    "nimrod_include_n0_mode": False,   # write an n00 entry in multi-n runs
+    "nimrod_store_complex": False,     # also write <field>_re / <field>_im
+
+    # Poloidal Fourier spectra of the mode eigenfunctions on flux-aligned
+    # coordinates of the equilibrium (port of M3D-C1's flux_coordinates()).
+    # Written to /perturbations/<nXX>/spectra/<field>/. Omit 'mode_spectra' to disable.
+    "mode_spectra": ["p"],             # currently only 'p' is supported
+    "spectrum_fcoords": "pest",        # 'pest' (default), 'boozer', 'hamada'; '' = geometric (fallback only)
+    "spectrum_points": 200,            # number of theta AND psi points
+    "spectrum_phi": 0.0,               # toroidal angle (M3D-C1 convention)
+    "spectrum_store_fluxgrid": True,   # also store eigenfunction[theta, psi], R, Z, theta
+    "spectrum_include_omega": False,   # Boozer/Hamada only: evaluate at constant zeta instead of phi
+    "spectrum_theta_oversample": 1,    # 1 = faithful M3D-C1 algorithm
+
+    # NIMROD flux-coordinate construction (psi is reconstructed from B along rays)
+    "nimrod_psi_ray_samples": 800,     # samples per ray (default 4 * spectrum_points)
+    # "nimrod_xpoint_guess": [[1.3, -1.1], [1.3, 1.1]],  # optional X-point guesses [R, Z]
+    # "nimrod_psi_lcfs": 0.25,         # optional override for psi_LCFS - psi_axis (Wb/rad)
     
     # Grid Specifications
     "shared_grid_source": "first", # Options: 'first', '/path/to/simulation', or None
