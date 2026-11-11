@@ -39,6 +39,18 @@ them are handled here:
     (Lmod chatter plus a remote traceback).  The requested traces are therefore
     pre-filtered against what the simulation really contains, and any remaining
     failure is reported with utils.brief_error() as a single short line.
+
+Poloidal mode spectra (config key 'mode_spectra') are computed by
+get_mode_spectrum(), a port of the numerical core of
+m3dc1.eigenfunction.eigenfunction(fourier=True) that is safe with respect to
+the shared state listed above:
+    * flux_coordinates() is called with an explicit flux coordinate system,
+      and the equilibrium's 'fc' attribute (shared with flux_average()) is
+      saved and restored around the call;
+    * the fusion-io time slice is re-asserted before every evaluation;
+    * the toroidal mode number is taken from the directory name, never from a
+      parameter file (which is not available in campaign mode);
+    * the unit conversion uses the actual field name instead of 'p'.
 """
 
 import os
@@ -71,12 +83,22 @@ except ImportError:
     _M3DC1_AVAILABLE = False
     print("Warning: fpy or m3dc1 modules not found. M3D-C1 extraction will fail if called.")
 
+# Only needed for poloidal mode spectra; imported separately so that a missing
+# module does not affect any other M3D-C1 functionality.
+try:
+    from m3dc1.flux_coordinates import flux_coordinates
+    import m3dc1.fpylib as fpyl
+    _M3DC1_SPECTRUM_AVAILABLE = True
+except ImportError:
+    _M3DC1_SPECTRUM_AVAILABLE = False
+
 from .base import SimulationAdapter
 from .campaign import CampaignArchive, CampaignContext
 from .utils import (
     printwarn, printerr, printnote,
     compute_file_hash, auto_cast, generate_unique_filename,
     brief_error, is_missing_error, summarize_names,
+    poloidal_spectrum,
     GridSpec,
     _infer_machine_and_shot, _allocate_imas_run, _imas_entry_dir,
 )
@@ -110,6 +132,11 @@ class M3DC1Adapter(SimulationAdapter):
         self._trace_names = None
         self._skipped_traces = set()
         self._failed_traces = set()
+
+        # Poloidal spectrum bookkeeping (see get_mode_spectrum).
+        self._spectrum_fc_cache = {}
+        self._spectrum_fc_failed = set()
+        self._spectrum_warned = set()
 
         # Mode directories (local paths) or campaign simulation paths.
         if campaign is not None and getattr(campaign, "modes", None):
@@ -274,6 +301,9 @@ class M3DC1Adapter(SimulationAdapter):
         self._skipped_traces = set()
         self._failed_traces = set()
         self._trace_names = None
+
+        self._spectrum_fc_cache = {}
+        self._spectrum_fc_failed = set()
 
         self._eq_sim = None
         self._mode_sims = {}
@@ -918,6 +948,208 @@ class M3DC1Adapter(SimulationAdapter):
         elif grid_spec.type == "inside_wall":
             return self._evaluate_inside_wall(name, sim, m3dc1_units)
         raise ValueError(f"Unknown grid type: {grid_spec.type}")
+
+    # -----------------------------------------------------------------------
+    # Poloidal mode spectra (port of m3dc1.eigenfunction.eigenfunction)
+    # -----------------------------------------------------------------------
+
+    def _warn_spectrum_once(self, key, message):
+        if key not in self._spectrum_warned:
+            printwarn(message)
+            self._spectrum_warned.add(key)
+
+    def _get_spectrum_fc(self, settings):
+        """
+        Builds (and caches) the flux coordinates used for poloidal spectra on
+        the equilibrium sim.
+
+        flux_coordinates() stores its result in eq.fc, which is shared with
+        flux_average() and _attach_equilibrium_fc().  The previous object is
+        therefore saved and restored so that the flux averages are unaffected
+        by the spectrum resolution / coordinate choice.
+
+        flux_coordinates() reports failure by returning None or 0 (instead of
+        raising); in that case eq.fc is not replaced, which is what is checked
+        here.  Note that for the equilibrium sim (time slice -1) it reads
+        xmag / zmag / psi_lcfs from the LAST entry of the time traces; this is
+        existing M3D-C1 behaviour and is kept.
+        """
+        fcoords = settings["fcoords"]
+        m3dc1_fcoords = "" if fcoords == "geometric" else fcoords
+        points = int(settings["points"])
+        phit = float(settings["phi"])
+        key = (points, m3dc1_fcoords, phit)
+
+        if key in self._spectrum_fc_cache:
+            return self._spectrum_fc_cache[key]
+        if key in self._spectrum_fc_failed:
+            return None
+
+        eq = self._get_eq_sim()
+        if eq is None:
+            self._spectrum_fc_failed.add(key)
+            return None
+
+        if fcoords == "geometric":
+            self._warn_spectrum_once(
+                "geometric",
+                "Poloidal spectra requested with the GEOMETRIC poloidal angle. "
+                "Spectra depend on the angle definition; use 'pest' or 'boozer' "
+                "unless this is intended."
+            )
+
+        saved_fc = getattr(eq, 'fc', None)
+        fc = None
+        try:
+            self._sync_timeslice(eq)
+            res = flux_coordinates(sim=eq, filename=self._h5_filename(eq),
+                                   time=self._sim_time(eq), fcoords=m3dc1_fcoords,
+                                   phit=phit, points=points, makeplot=False,
+                                   quiet=True)
+            new_fc = getattr(eq, 'fc', None)
+            if res is not None and not (isinstance(res, (int, float)) and res == 0) \
+                    and new_fc is not None and new_fc is not saved_fc:
+                fc = new_fc
+            else:
+                printerr(f"flux_coordinates() failed ({fcoords or 'geometric'}, "
+                         f"points={points}) for {self.model_dir}; no poloidal spectra.")
+        except Exception as exc:
+            printerr(f"flux_coordinates() failed for {self.model_dir}: {brief_error(exc)}")
+        finally:
+            try:
+                eq.fc = saved_fc
+            except Exception:
+                pass
+            self._sync_timeslice(eq)
+
+        if fc is None:
+            self._spectrum_fc_failed.add(key)
+            return None
+
+        self._spectrum_fc_cache[key] = fc
+        return fc
+
+    def get_mode_spectrum(self, mode_dir, field, settings, n=None):
+        """
+        Poloidal Fourier spectrum of the eigenfunction
+            ef = field(mode sim, time='last') - field(equilibrium, time=-1)
+        evaluated on the flux-coordinate grid of the equilibrium at constant
+        geometric toroidal angle phi = settings['phi'], exactly as in
+        m3dc1.eigenfunction.eigenfunction(fourier=True):
+            amplitude = |rfft(ef, axis=0, norm='forward')|
+        """
+        if not (_M3DC1_AVAILABLE and _M3DC1_SPECTRUM_AVAILABLE):
+            self._warn_spectrum_once(
+                "unavailable",
+                "m3dc1.flux_coordinates / m3dc1.fpylib not available; "
+                "M3D-C1 poloidal spectra are skipped."
+            )
+            return {}
+
+        if settings.get("include_omega"):
+            self._warn_spectrum_once(
+                "omega",
+                "spectrum_include_omega is not implemented for M3D-C1; spectra are "
+                "evaluated at constant geometric toroidal angle (as in eigenfunction())."
+            )
+
+        eq = self._get_eq_sim()
+        mode = self._get_mode_sim(mode_dir)
+        if eq is None or mode is None:
+            return {}
+
+        field_info = getattr(mode, 'typedict', getattr(mode, 'available_fields', {})).get(field, None)
+        if field_info and field_info[1] != 'scalar':
+            self._warn_spectrum_once(
+                f"vector::{field}",
+                f"Poloidal spectra of non-scalar field '{field}' are not supported yet; skipping."
+            )
+            return {}
+
+        fc = self._get_spectrum_fc(settings)
+        if fc is None:
+            return {}
+
+        phit = float(settings["phi"])
+        rpath = np.asarray(fc.rpath, dtype=float)
+        zpath = np.asarray(fc.zpath, dtype=float)
+        torphi = np.full_like(rpath, phit)
+
+        try:
+            self._sync_timeslice(mode)
+            p1 = eval_field(field, rpath, torphi, zpath, coord='scalar', sim=mode,
+                            filename=self._h5_filename(mode),
+                            time=self._sim_time(mode), quiet=True)
+            self._sync_timeslice(eq)
+            p0 = eval_field(field, rpath, torphi, zpath, coord='scalar', sim=eq,
+                            filename=self._h5_filename(eq),
+                            time=self._sim_time(eq), quiet=True)
+        except Exception as exc:
+            printerr(f"Eigenfunction evaluation of '{field}' failed for {mode_dir}: "
+                     f"{brief_error(exc)}")
+            return {}
+        finally:
+            self._sync_timeslice(eq)
+
+        ef = np.asarray(p1, dtype=float) - np.asarray(p0, dtype=float)
+        if ef.shape != rpath.shape:
+            try:
+                ef = ef.reshape(rpath.shape)
+            except Exception:
+                printerr(f"Eigenfunction of '{field}' has unexpected shape {ef.shape} "
+                         f"(expected {rpath.shape}) for {mode_dir}.")
+                return {}
+
+        # Same conversion rule as eigenfunction(), but with the real field name.
+        m3dc1_units = self._map_units(settings.get("units", "codeunits"))
+        if m3dc1_units == 'm3dc1':
+            try:
+                ef = np.asarray(fpyl.get_conv_field(m3dc1_units, field, ef, sim=eq),
+                                dtype=float)
+            except Exception as exc:
+                self._warn_spectrum_once(
+                    f"conv::{field}",
+                    f"Unit conversion of '{field}' for the spectrum failed "
+                    f"({brief_error(exc)}); raw values are used."
+                )
+
+        n_bad = int(np.count_nonzero(~np.isfinite(ef)))
+        if n_bad:
+            printwarn(f"M3D-C1 spectrum '{field}' ({Path(mode_dir).name}): {n_bad} "
+                      "flux-grid points could not be evaluated; affected surfaces "
+                      "will contain NaN.")
+
+        amplitude, m = poloidal_spectrum(ef)
+
+        theta = getattr(fc, 'theta', None)
+        if theta is None:
+            theta = 2.0 * np.pi * np.arange(rpath.shape[0]) / rpath.shape[0]
+
+        out = {
+            "psi_norm":  np.asarray(fc.psi_norm, dtype=float),
+            "m":         m,
+            "amplitude": amplitude,
+            "_attrs": {
+                "code":             self.CODE_NAME,
+                "field":            str(field),
+                "n":                int(n) if n is not None else -1,
+                "fcoords":          settings["fcoords"],
+                "phi":              phit,
+                "toroidal_angle":   "geometric_phi",
+                "points":           int(settings["points"]),
+                "normalization":    "rfft_forward_abs",
+                "theta_convention": "theta=0 outboard midplane, clockwise in (R,Z)",
+            },
+        }
+        q = getattr(fc, 'q', None)
+        if q is not None:
+            out["q"] = np.asarray(q, dtype=float)
+        if settings.get("store_fluxgrid"):
+            out["eigenfunction"] = ef
+            out["R"] = rpath
+            out["Z"] = zpath
+            out["theta"] = np.asarray(theta, dtype=float)
+        return out
 
     def get_time_metadata(self, time_slices):
         meta = {
