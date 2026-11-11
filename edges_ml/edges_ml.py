@@ -15,6 +15,18 @@ Shared utilities, label registries, and IMAS helpers live in:
 Remote data access (ADIOS2 campaign archives) lives in:
 
     edges_ml/campaign.py
+
+Perturbation output
+-------------------
+Every mode directory is expanded into one or more perturbation entries by
+adapter.extract_mode_entries().  M3D-C1 produces one entry per directory;
+NIMROD produces one entry per toroidal mode stored in the dump (single-n and
+multi-n runs).  If an entry name is already taken (e.g. the same n in several
+directories), the entry is written as '<dir>_<entry>' instead.
+
+Poloidal spectra (config key 'mode_spectra') are written to
+    perturbations/<entry>/spectra/<field>/{psi_norm, m, amplitude, ...}
+with the spectrum metadata stored as group attributes.
 """
 
 import os
@@ -34,6 +46,7 @@ from .utils import (
     printwarn, printerr, printnote,
     expand_request, GridSpec,
     generate_unique_filename,
+    brief_error,
     FIELD_LABELS, FLUX_AVERAGE_LABELS, FLUX_AVERAGE_ONLY_LABELS,
     TIME_TRACE_LABELS,
     FIELD_UNITS_CODE, FLUX_AVERAGE_ONLY_UNITS_CODE, TIME_TRACE_UNITS_CODE,
@@ -47,6 +60,11 @@ from .campaign import (
 from .base import SimulationAdapter
 from .m3dc1_adapter import M3DC1Adapter
 from .nimrod_adapter import NIMRODAdapter
+
+
+# Key inside nested data dictionaries whose content is written as attributes
+# of the enclosing group (used by the poloidal spectra).
+ATTRS_KEY = "_attrs"
 
 
 # ===========================================================================
@@ -94,6 +112,77 @@ def write_array_group(parent, name, data_dict, unit_mapping=None, desc_mapping=N
                 dset.attrs['description'] = desc_mapping[base_key]
 
     return grp
+
+
+def _set_h5_attribute(obj, key, value):
+    """Stores a single attribute value on an HDF5 group/dataset."""
+    if value is None:
+        return
+    try:
+        if isinstance(value, (str, bool, int, float, np.integer, np.floating, np.bool_)):
+            obj.attrs[key] = value
+        else:
+            obj.attrs[key] = np.asarray(value)
+    except Exception as exc:
+        printwarn(f"Could not write attribute '{key}': {brief_error(exc)}")
+
+
+def write_nested_group(parent, name, data_dict):
+    """
+    Recursively writes a nested dictionary as HDF5 groups / datasets.
+
+    Sub-dictionaries become sub-groups.  The special key ATTRS_KEY holds a
+    flat dictionary that is written as attributes of the enclosing group.
+    """
+    grp = parent.create_group(name)
+    for key, value in data_dict.items():
+        if value is None:
+            continue
+        if key == ATTRS_KEY and isinstance(value, dict):
+            for ak, av in value.items():
+                _set_h5_attribute(grp, ak, av)
+            continue
+        if isinstance(value, dict):
+            write_nested_group(grp, key, value)
+        elif isinstance(value, str):
+            grp.create_dataset(key, data=np.bytes_(value))
+        else:
+            grp.create_dataset(key, data=np.asarray(value))
+    return grp
+
+
+def _unique_entry_name(entry_name, mode_name, existing):
+    """
+    Returns a perturbation entry name that is not yet in *existing*.
+
+    On a collision the entry is prefixed with its mode directory name
+    ('<dir>_<entry>'); if that is taken as well a numeric suffix is added.
+    """
+    if entry_name not in existing:
+        return entry_name
+
+    base = f"{mode_name}_{entry_name}" if entry_name != mode_name else f"{mode_name}_dup"
+    cand = base
+    counter = 1
+    while cand in existing:
+        cand = f"{base}_{counter}"
+        counter += 1
+
+    printwarn(f"Perturbation entry '{entry_name}' already exists; writing the entry "
+              f"from {mode_name} as '{cand}'.")
+    return cand
+
+
+def _safe_mode_entries(adapter, mode_dir, config):
+    """
+    Calls adapter.extract_mode_entries() and turns failures into an empty
+    list, so that one broken mode directory does not abort the whole file.
+    """
+    try:
+        return adapter.extract_mode_entries(mode_dir, config) or []
+    except Exception as exc:
+        printerr(f"Mode extraction failed for {mode_dir}: {brief_error(exc)}")
+        return []
 
 
 # ===========================================================================
@@ -375,21 +464,22 @@ def build_dataset(sources, output_directory, config):
                     grp_hash_mode = grp_hashes.create_group(mode_name)
                     write_dict_as_datasets(grp_hash_mode, repro_hashes)
 
-                    mode_data    = adapter.extract_mode(mode_dir, config)
-                    mode_entries = adapter.get_all_mode_entries(mode_dir, config)
-                    for entry_name, entry_meta in mode_entries:
-                        if entry_name in grp_modes:
-                            printwarn(f"Perturbation group '{entry_name}' already exists; skipping duplicate from {mode_dir}.")
-                            continue
-                        grp_mode      = grp_modes.create_group(entry_name)
+                    for entry_name, entry_meta, mode_data in _safe_mode_entries(adapter, mode_dir, config):
+                        name = _unique_entry_name(entry_name, mode_name, grp_modes)
+
+                        grp_mode      = grp_modes.create_group(name)
                         grp_mode_meta = grp_mode.create_group("mode_information")
                         write_dict_as_datasets(grp_mode_meta, entry_meta)
-                        write_array_group(grp_mode, "1d_profiles", mode_data["1d_profiles"],
+                        write_array_group(grp_mode, "1d_profiles", mode_data.get("1d_profiles", {}),
                                           unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)
-                        write_array_group(grp_mode, "2d_fields", mode_data["2d_fields"],
+                        write_array_group(grp_mode, "2d_fields", mode_data.get("2d_fields", {}),
                                           unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)
-                        write_array_group(grp_mode, "3d_fields", mode_data["3d_fields"],
+                        write_array_group(grp_mode, "3d_fields", mode_data.get("3d_fields", {}),
                                           unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)
+
+                        spectra = mode_data.get("spectra")
+                        if spectra:
+                            write_nested_group(grp_mode, "spectra", spectra)
 
             adapter.close()
 
@@ -419,9 +509,30 @@ def build_dataset(sources, output_directory, config):
             if include_inputs:
                 inputs = adapter.get_all_input_parameters()
 
+            def write_adios_attributes(fh, attrs, base_path):
+                """Writes a flat dictionary as ADIOS2 attributes of a group path."""
+                for ak, av in attrs.items():
+                    if av is None:
+                        continue
+                    name = f"{base_path}/{ak}" if base_path else str(ak)
+                    try:
+                        if isinstance(av, str):
+                            fh.write_attribute(name, av)
+                        elif isinstance(av, (bool, np.bool_)):
+                            fh.write_attribute(name, np.array([int(av)]))
+                        elif np.isscalar(av):
+                            fh.write_attribute(name, np.array([av]))
+                        else:
+                            fh.write_attribute(name, np.asarray(av))
+                    except Exception as exc:
+                        printwarn(f"Could not write ADIOS2 attribute '{name}': {brief_error(exc)}")
+
             def write_adios_recursive(fh, data_dict, base_path="", unit_mapping=None, desc_mapping=None):
                 for key, val in data_dict.items():
                     if val is None:
+                        continue
+                    if key == ATTRS_KEY and isinstance(val, dict):
+                        write_adios_attributes(fh, val, base_path)
                         continue
                     path = f"{base_path}/{key}" if base_path else key
                     if isinstance(val, dict):
@@ -486,20 +597,22 @@ def build_dataset(sources, output_directory, config):
                     repro_hashes = adapter.get_reproducibility_data(mode_dir)
                     write_adios_recursive(fh, repro_hashes, f"metadata/file_hashes/{mode_name}")
 
-                    mode_data    = adapter.extract_mode(mode_dir, config)
-                    mode_entries = adapter.get_all_mode_entries(mode_dir, config)
-                    for entry_name, entry_meta in mode_entries:
-                        if entry_name in seen_bp_entries:
-                            printwarn(f"Perturbation entry '{entry_name}' already written; skipping duplicate from {mode_dir}.")
-                            continue
-                        seen_bp_entries.add(entry_name)
-                        write_adios_recursive(fh, entry_meta, f"perturbations/{entry_name}/mode_information")
-                        write_adios_recursive(fh, mode_data["1d_profiles"], f"perturbations/{entry_name}/1d_profiles",
+                    for entry_name, entry_meta, mode_data in _safe_mode_entries(adapter, mode_dir, config):
+                        name = _unique_entry_name(entry_name, mode_name, seen_bp_entries)
+                        seen_bp_entries.add(name)
+
+                        base = f"perturbations/{name}"
+                        write_adios_recursive(fh, entry_meta, f"{base}/mode_information")
+                        write_adios_recursive(fh, mode_data.get("1d_profiles", {}), f"{base}/1d_profiles",
                                               unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)
-                        write_adios_recursive(fh, mode_data["2d_fields"], f"perturbations/{entry_name}/2d_fields",
+                        write_adios_recursive(fh, mode_data.get("2d_fields", {}), f"{base}/2d_fields",
                                               unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)
-                        write_adios_recursive(fh, mode_data["3d_fields"], f"perturbations/{entry_name}/3d_fields",
+                        write_adios_recursive(fh, mode_data.get("3d_fields", {}), f"{base}/3d_fields",
                                               unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)
+
+                        spectra = mode_data.get("spectra")
+                        if spectra:
+                            write_adios_recursive(fh, spectra, f"{base}/spectra")
 
             adapter.close()
 
