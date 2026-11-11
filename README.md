@@ -272,12 +272,133 @@ Top-level config keys:
 | `2d_fields`              | `None`           | List of quantities, or `"all"`                   |
 | `3d_fields`              | `None`           | List of quantities, or `"all"`                   |
 | `time_traces`            | `None`           | List of quantities, or `"all"`                   |
+| `mode_1d_profiles`       | `None`           | Perturbation 1D profiles (e.g. `"q_profile"`)    |
 | `mode_2d_fields`         | `None`           | Perturbation 2D fields                           |
 | `mode_3d_fields`         | `None`           | Perturbation 3D fields                           |
+| `mode_spectra`           | `None`           | Fields for poloidal mode spectra (e.g. `["p"]`); see below |
 | `time_slices`            | `[]`             | List of integer time slice indices               |
 | `resolutions`            | `{"1d": 200}`    | Grid resolution settings                         |
 | `include_input_namelist` | `False`          | Whether to save code input parameters            |
 | `shared_grid_source`     | `None`           | `"first"` or path to a model dir for shared grid |
+
+---
+
+## Mode Perturbations and Poloidal Spectra
+
+### Perturbation entries
+
+Each mode directory is expanded into one or more entries under `/perturbations/`:
+
+| Code   | Entries                                    | How the perturbation is obtained |
+|--------|--------------------------------------------|----------------------------------|
+| M3D-C1 | one per `nXX` directory                    | `field(mode run, last time slice) − field(equilibrium)` |
+| NIMROD | one per toroidal mode stored in the dump (`keff` of the last dump) | complex Fourier coefficient `c_n` of the perturbation, evaluated with `EvalNimrod.eval_comp_field()` |
+
+For NIMROD this works the same way for single-n and multi-n runs. No full fields are
+subtracted, so there is no cancellation against the equilibrium. The stored 2D/3D fields are
+the physical perturbation of mode n, `2 Re[c_n e^{i n φ}]` (for n = 0: `Re[c_0]`), at the
+toroidal angle of the output grid (φ = 0 for 2D grids).
+
+Additional NIMROD options:
+
+| Key                       | Default | Description |
+|---------------------------|---------|-------------|
+| `nimrod_include_n0_mode`  | `False` | Write an `n00` entry in multi-n runs (skipped by default) |
+| `nimrod_store_complex`    | `False` | Also write `<field>_re` / `<field>_im` datasets with the complex coefficient |
+
+If an entry name is already taken (for example the same n in several directories), the
+later entry is written as `<dir>_nXX` instead of being skipped, and a warning is printed.
+
+### Poloidal spectra
+
+Setting `mode_spectra` (currently only `["p"]` is supported) adds the poloidal Fourier
+spectrum of each mode's eigenfunction, computed the same way as M3D-C1's
+`eigenfunction(fourier=True)`:
+
+1. Build a flux-coordinate grid of the **equilibrium** with `spectrum_points` poloidal and
+   radial points: uniform in normalised poloidal flux ψ_N ∈ [1e-4, 1] and uniform in the
+   poloidal angle θ.
+2. Evaluate the eigenfunction on that grid at constant geometric toroidal angle
+   φ = `spectrum_phi`.
+3. Compute `amplitude = |rfft(eigenfunction, axis=θ, norm='forward')|` for every surface.
+
+**The spectrum depends on the choice of poloidal angle.** Use a flux-aligned
+(straight-field-line) coordinate system:
+
+| `spectrum_fcoords`   | Poloidal angle |
+|----------------------|----------------|
+| `"pest"` (default)   | PEST |
+| `"boozer"`           | Boozer |
+| `"hamada"`           | Hamada |
+| `"canonical"`        | identical to PEST after normalisation |
+| `""` / `"geometric"` | geometric angle — **fallback for special cases only**, a warning is printed |
+
+Conventions shared by both codes:
+
+- θ = 0 lies on the outboard midplane, and θ increases clockwise in the (R, Z) plane, as in M3D-C1.
+- φ follows the M3D-C1 direction. NIMROD coefficients are complex-conjugated accordingly.
+- `m = 0 … n_θ/2` is the poloidal mode number. Only the magnitude is stored, so the sign of m
+  (helicity) is not resolved.
+
+**M3D-C1** calls `m3dc1.flux_coordinates.flux_coordinates()`. The flux coordinates used for
+the flux averages are not affected.
+
+**NIMROD** has no poloidal flux function. `edges_ml/nimrod_fluxcoords.py` therefore
+reconstructs ψ by integrating the equilibrium magnetic field along rays from the magnetic
+axis, then builds the straight-field-line angle with a faithful port of the M3D-C1 algorithm.
+ψ at the LCFS is taken as the smallest of these candidates:
+
+- the separatrix estimate from the ray integration;
+- the flux at X-points found with `nimpy.fsa.find_pf_null`, starting from an automatic search
+  and from `nimrod_xpoint_guess`.
+
+`nimrod_psi_lcfs` overrides the result.
+
+### Spectrum configuration keys
+
+| Key                         | Default                     | Description |
+|-----------------------------|-----------------------------|-------------|
+| `mode_spectra`              | off                         | Fields to compute spectra for, e.g. `["p"]` |
+| `spectrum_points`           | `200`                       | Number of θ **and** ψ points (like `points` in `eigenfunction()`) |
+| `spectrum_fcoords`          | `fcoords`, else `"pest"`    | Flux coordinate system (table above) |
+| `spectrum_phi`              | `0.0`                       | Toroidal angle at which the eigenfunction is evaluated |
+| `spectrum_store_fluxgrid`   | `False`                     | Also store the eigenfunction and the (R, Z) flux grid |
+| `spectrum_include_omega`    | `False`                     | NIMROD only: for Boozer/Hamada evaluate at constant toroidal flux-coordinate angle ζ instead of geometric φ |
+| `spectrum_theta_oversample` | `1`                         | NIMROD only: θ oversampling of the flux-coordinate construction (1 = M3D-C1 algorithm) |
+| `nimrod_psi_ray_samples`    | `4 × spectrum_points`       | NIMROD only: samples per ray for the ψ integration |
+| `nimrod_xpoint_guess`       | `None`                      | NIMROD only: `[R, Z]` or list of `[R, Z]` X-point guesses |
+| `nimrod_psi_lcfs`           | `None`                      | NIMROD only: override for ψ_LCFS − ψ_axis (Wb/rad, magnitude used) |
+
+### Spectrum output
+
+Datasets in `/perturbations/<entry>/spectra/<field>/`:
+
+| Dataset         | Shape          | Description |
+|-----------------|----------------|-------------|
+| `psi_norm`      | `[n_ψ]`        | Normalised poloidal flux of the surfaces |
+| `m`             | `[n_m]`        | Poloidal mode numbers |
+| `amplitude`     | `[n_m, n_ψ]`   | Spectrum amplitude |
+| `q`             | `[n_ψ]`        | Safety factor on the same surfaces (if available) |
+| `eigenfunction` | `[n_θ, n_ψ]`   | Eigenfunction on the flux grid (`spectrum_store_fluxgrid`) |
+| `R`, `Z`        | `[n_θ, n_ψ]`   | Flux grid coordinates (`spectrum_store_fluxgrid`) |
+| `theta`         | `[n_θ]`        | Poloidal angle (`spectrum_store_fluxgrid`) |
+| `omega`         | `[n_θ, n_ψ]`   | NIMROD only: ζ − φ for Boozer/Hamada (`spectrum_store_fluxgrid` and `spectrum_include_omega`) |
+
+Group attributes: `code`, `field`, `n`, `fcoords`, `phi`, `toroidal_angle`, `points`,
+`normalization`, `theta_convention`. NIMROD additionally stores `psi_lcfs`, `psi_lcfs_source`,
+`n_clipped` and `n_unreached`, which help check the quality of the flux grid.
+
+### Known limitations
+
+- Only scalar fields are supported for spectra; vector fields (B, v, …) are planned.
+- NIMROD: the mode axis returned by `eval_comp_field()` is assumed to follow the order of
+  `keff` in the dump. A warning is printed if the mode counts disagree.
+- NIMROD: the existing FSA-based flux averages and global parameters still normalise ψ_N to
+  the domain boundary in diverted cases. The spectrum grid uses the separatrix.
+- M3D-C1: `spectrum_include_omega` is not implemented. Spectra are evaluated at constant
+  geometric φ, as in `eigenfunction()`.
+- M3D-C1 campaign-archive mode: spectra depend on `flux_coordinates()` working with the
+  streamed data. If it fails, spectra are skipped for that model with an error message.
 
 ---
 
@@ -315,6 +436,9 @@ Top-level config keys:
 /perturbations/<nXX>/1d_profiles/
 /perturbations/<nXX>/2d_fields/
 /perturbations/<nXX>/3d_fields/
+/perturbations/<nXX>/spectra/<field>/   (if mode_spectra requested)
 ```
+
+Perturbation entries are named `nXX`; on a name collision `<dir>_nXX` is used.
 
 For information on the IMAS schema please see https://imas-data-dictionary.readthedocs.io/en/latest/reference_ids.html
