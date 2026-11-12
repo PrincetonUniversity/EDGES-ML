@@ -1,5 +1,16 @@
 """
 Abstract base class for all simulation code adapters in edges-ml.
+
+The quantities to export are taken from the resolved export selection
+(utils.export_selection), which has the same structure for every section:
+
+    equilibrium   -> flux_averages / 2d_fields / 3d_fields
+    total_fields  -> flux_averages / 2d_fields / 3d_fields   (per time slice)
+    perturbations -> flux_averages / 2d_fields / 3d_fields   (+ poloidal spectra
+                                                              of the same quantities)
+
+All 2D / 3D fields of all sections are evaluated on the same grids
+('2d_grid' / '3d_grid').
 """
 
 import numpy as np
@@ -9,17 +20,20 @@ from typing import Union
 from .utils import (
     printwarn, printerr,
     GridSpec,
-    expand_request,
     brief_error,
+    expand_request,
+    export_selection,
+    unique_names,
     spectrum_settings,
     parse_toroidal_mode_number,
     _subtract_field_results,
-    AVAILABLE_1D_PROFILES,
-    AVAILABLE_2D_FIELDS,
-    AVAILABLE_3D_FIELDS,
     AVAILABLE_FLUX_AVERAGES,
     AVAILABLE_TIME_TRACES,
 )
+
+
+DEFAULT_GRID_2D = GridSpec("rectangular", (128, 128))
+DEFAULT_GRID_3D = GridSpec("rectangular", (64, 16, 64))
 
 
 class SimulationAdapter:
@@ -35,6 +49,14 @@ class SimulationAdapter:
         if method_name not in self._warned_methods:
             printwarn(f"Warning: {method_name}() is not yet implemented for {self.CODE_NAME}. Skipping.")
             self._warned_methods.add(method_name)
+
+    @staticmethod
+    def _grid_spec(config, dim):
+        """Grid used for ALL 2D (dim=2) or 3D (dim=3) fields of every section."""
+        cfg = config or {}
+        if dim == 2:
+            return cfg.get("2d_grid", DEFAULT_GRID_2D)
+        return cfg.get("3d_grid", DEFAULT_GRID_3D)
 
     # --- Abstract Methods (Safely stubbed to skip when not implemented by subclass) ---
     def get_metadata(self, mode_dirs):
@@ -90,8 +112,14 @@ class SimulationAdapter:
         self._warn_unimplemented('get_mode_metadata')
         return {"growth_rate": 0.0, "frequency": 0.0, "mode_type": -100}
 
-    def get_mode_1d_profile(self, mode_dir, name, resolution, units):
-        self._warn_unimplemented('get_mode_1d_profile')
+    def get_mode_flux_average(self, mode_dir, name, resolution, units, fcoords):
+        """
+        Flux average of the perturbation of *name* on the equilibrium 1D grid:
+            <field>(mode simulation) - <field>(equilibrium)
+        Returns an array (scalars), a {component: array} dict (vectors) or an
+        empty array if not available.
+        """
+        self._warn_unimplemented('get_mode_flux_average')
         return np.array([])
 
     def get_mode_2d_mesh(self, mode_dir, grid_spec):
@@ -120,7 +148,7 @@ class SimulationAdapter:
         mode_dir : Path
             Mode directory (or campaign simulation path).
         field : str
-            edges-ml field name (see utils.AVAILABLE_SPECTRUM_FIELDS).
+            edges-ml field name (one of the perturbation quantities).
         settings : dict
             Output of utils.spectrum_settings(config).
         n : int, optional
@@ -133,7 +161,7 @@ class SimulationAdapter:
               "psi_norm":  [n_psi],
               "m":         [n_m],
               "amplitude": [n_m, n_psi],
-              (optional) "q", "eigenfunction", "R", "Z", "theta", ...,
+              (optional, store_fluxgrid) "eigenfunction", "R", "Z", "theta", ...,
               "_attrs":    {...}   # written as group attributes
             }
             or {} if not available.
@@ -165,11 +193,10 @@ class SimulationAdapter:
         Returns a list of (entry_name, entry_metadata, mode_data) tuples for a
         mode directory.
 
-        The default implementation reproduces the historical behaviour: the
-        mode data are extracted once and shared by every entry returned by
-        get_all_mode_entries().  Adapters that resolve several toroidal modes
-        per directory (e.g. NIMROD multi-n runs) override this method to
-        return per-mode data.
+        The default implementation extracts the mode data once and shares it
+        between every entry returned by get_all_mode_entries().  Adapters that
+        resolve several toroidal modes per directory (e.g. NIMROD multi-n runs)
+        override this method to return per-mode data.
         """
         mode_data = self.extract_mode(mode_dir, config)
         entries   = self.get_all_mode_entries(mode_dir, config)
@@ -184,6 +211,7 @@ class SimulationAdapter:
         Extracts all static grids and the time coordinate mapping into one structure.
         """
         grids = {}
+        sel     = export_selection(config)
         res_1d  = config.get("resolutions", {}).get("1d", 200)
         units   = config.get("units", "codeunits")
         fcoords = config.get("fcoords", "pest")
@@ -192,7 +220,11 @@ class SimulationAdapter:
         if time_slices:
             grids["time"] = self.get_time_metadata(time_slices)
 
-        fluxes_to_try = expand_request(config.get("flux_averages"), AVAILABLE_FLUX_AVERAGES)
+        fluxes_to_try = unique_names(
+            sel["equilibrium"]["flux_averages"]
+            + sel["total_fields"]["flux_averages"]
+            + sel["perturbations"]["flux_averages"]
+        )
         if not fluxes_to_try:
             fluxes_to_try = AVAILABLE_FLUX_AVERAGES
 
@@ -203,19 +235,17 @@ class SimulationAdapter:
                 grids["1d_grid"] = f_mesh
                 break
 
-        grid_2d = config.get("2d_grid", GridSpec("rectangular", (128, 128)))
-        grids["2d_grid"] = self.get_2d_mesh(grid_2d)
-
-        grid_3d = config.get("3d_grid", GridSpec("rectangular", (64, 16, 64)))
-        grids["3d_grid"] = self.get_3d_mesh(grid_3d)
+        grids["2d_grid"] = self.get_2d_mesh(self._grid_spec(config, 2))
+        grids["3d_grid"] = self.get_3d_mesh(self._grid_spec(config, 3))
 
         return grids
 
     def extract_equilibrium(self, config):
         """
-        Parses the config dictionary and extracts all the shared,
-        time-independent or base-state equilibrium quantities.
+        Extracts the equilibrium quantities listed under config['equilibrium'],
+        plus the global parameters and the time traces.
         """
+        sel = export_selection(config)["equilibrium"]
         data = {
             "global_parameters": self.get_global_parameters(),
             "2d_fields": {}, "3d_fields": {},
@@ -226,26 +256,23 @@ class SimulationAdapter:
         units   = config.get("units", "codeunits")
         fcoords = config.get("fcoords", "pest")
 
-        fields_2d = expand_request(config.get("2d_fields"), AVAILABLE_2D_FIELDS)
-        grid_2d   = config.get("2d_grid", GridSpec("rectangular", (128, 128)))
-        for field in fields_2d:
+        grid_2d = self._grid_spec(config, 2)
+        for field in sel["2d_fields"]:
             val = self.get_2d_field(field, grid_2d, units, time=-1)
             if isinstance(val, dict):
                 data["2d_fields"].update(val)
             else:
                 data["2d_fields"][field] = val
 
-        fields_3d = expand_request(config.get("3d_fields"), AVAILABLE_3D_FIELDS)
-        grid_3d   = config.get("3d_grid", GridSpec("rectangular", (64, 16, 64)))
-        for field in fields_3d:
+        grid_3d = self._grid_spec(config, 3)
+        for field in sel["3d_fields"]:
             val = self.get_3d_field(field, grid_3d, units, time=-1)
             if isinstance(val, dict):
                 data["3d_fields"].update(val)
             else:
                 data["3d_fields"][field] = val
 
-        fluxes = expand_request(config.get("flux_averages"), AVAILABLE_FLUX_AVERAGES)
-        for name in fluxes:
+        for name in sel["flux_averages"]:
             _, f_vals = self.get_flux_average(name, res_1d, units, fcoords, time=-1)
             if isinstance(f_vals, dict):
                 data["flux_averages"].update(f_vals)
@@ -266,13 +293,14 @@ class SimulationAdapter:
 
     def extract_total_fields(self, config):
         """
-        Parses the config dictionary and extracts total fields across selected time slices.
-        Produces arrays of shape [N_t, ...]
+        Extracts the quantities listed under config['total_fields'] for every
+        selected time slice.  Produces arrays of shape [N_t, ...].
         """
         time_slices = config.get("time_slices", [])
         if not time_slices:
             return None
 
+        sel = export_selection(config)["total_fields"]
         data = {
             "flux_averages": {},
             "2d_fields":     {},
@@ -283,8 +311,7 @@ class SimulationAdapter:
         units   = config.get("units", "codeunits")
         fcoords = config.get("fcoords", "pest")
 
-        fluxes = expand_request(config.get("total_flux_averages"), AVAILABLE_FLUX_AVERAGES)
-        for field in fluxes:
+        for field in sel["flux_averages"]:
             results = []
             for ts in time_slices:
                 _, f_vals = self.get_flux_average(field, res_1d, units, fcoords, time=ts, use_eq_fs=True)
@@ -297,9 +324,8 @@ class SimulationAdapter:
             else:
                 data["flux_averages"][field] = np.stack(results, axis=0) if results else np.array([])
 
-        fields_2d = expand_request(config.get("total_2d_fields"), AVAILABLE_2D_FIELDS)
-        grid_2d   = config.get("2d_grid", GridSpec("rectangular", (128, 128)))
-        for field in fields_2d:
+        grid_2d = self._grid_spec(config, 2)
+        for field in sel["2d_fields"]:
             results = []
             for ts in time_slices:
                 val = self.get_2d_field(field, grid_2d, units, time=ts)
@@ -310,9 +336,8 @@ class SimulationAdapter:
             else:
                 data["2d_fields"][field] = np.stack(results, axis=0) if results else np.array([])
 
-        fields_3d = expand_request(config.get("total_3d_fields"), AVAILABLE_3D_FIELDS)
-        grid_3d   = config.get("3d_grid", GridSpec("rectangular", (64, 16, 64)))
-        for field in fields_3d:
+        grid_3d = self._grid_spec(config, 3)
+        for field in sel["3d_fields"]:
             results = []
             for ts in time_slices:
                 val = self.get_3d_field(field, grid_3d, units, time=ts)
@@ -327,10 +352,10 @@ class SimulationAdapter:
 
     def _extract_mode_spectra(self, mode_dir, config, n=None):
         """
-        Computes the poloidal spectra requested by config['mode_spectra'].
+        Computes the poloidal spectra of all perturbation quantities
+        (scalar fields listed under config['perturbations']).
 
-        Returns {field: spectrum_dict} or {} when the feature is not requested
-        (the default), so existing configurations are not affected.
+        Returns {field: spectrum_dict} or {} if no such quantity is listed.
         """
         settings = spectrum_settings(config)
         if not settings["fields"]:
@@ -351,25 +376,44 @@ class SimulationAdapter:
                 spectra[field] = res
         return spectra
 
+    def _extract_mode_flux_averages(self, mode_dir, config):
+        """Perturbation flux averages listed under config['perturbations']."""
+        sel     = export_selection(config)["perturbations"]
+        res_1d  = config.get("resolutions", {}).get("1d", 200)
+        units   = config.get("units", "codeunits")
+        fcoords = config.get("fcoords", "pest")
+
+        out = {}
+        for name in sel["flux_averages"]:
+            try:
+                val = self.get_mode_flux_average(mode_dir, name, res_1d, units, fcoords)
+            except Exception as exc:
+                printerr(f"Perturbation flux average '{name}' failed for {mode_dir}: "
+                         f"{brief_error(exc)}")
+                continue
+            if isinstance(val, dict):
+                out.update({k: v for k, v in val.items() if np.size(v) > 0})
+            elif np.size(val) > 0:
+                out[name] = val
+        return out
+
     def extract_mode(self, mode_dir, config):
         """
-        Extracts the mode-specific perturbation data (eigenfunction).
-        eigenfunction = field(finite_time, mode sim) - field(equilibrium, time=-1)
+        Extracts the perturbation quantities listed under config['perturbations']:
+            perturbation = field(finite time, mode sim) - field(equilibrium, time=-1)
+        as flux averages, 2D fields and 3D fields, plus the poloidal spectra
+        of the same quantities.
         """
-        res_1d = config.get("resolutions", {}).get("1d", 200)
-        units  = config.get("units", "codeunits")
-        data   = {
+        sel   = export_selection(config)["perturbations"]
+        units = config.get("units", "codeunits")
+        data  = {
             "mode_information": self.get_mode_metadata(mode_dir),
-            "1d_profiles": {}, "2d_fields": {}, "3d_fields": {}
+            "flux_averages": self._extract_mode_flux_averages(mode_dir, config),
+            "2d_fields": {}, "3d_fields": {}
         }
 
-        fields_1d = expand_request(config.get("mode_1d_profiles"), AVAILABLE_1D_PROFILES)
-        for field in fields_1d:
-            data["1d_profiles"][field] = self.get_mode_1d_profile(mode_dir, field, res_1d, units)
-
-        grid_2d   = config.get("perturbation_2d_grid", config.get("2d_grid", GridSpec("rectangular", (128, 128))))
-        fields_2d = expand_request(config.get("mode_2d_fields"), AVAILABLE_2D_FIELDS)
-        for field in fields_2d:
+        grid_2d = self._grid_spec(config, 2)
+        for field in sel["2d_fields"]:
             val_finite = self.get_mode_2d_field(mode_dir, field, grid_2d, units)
             val_eq     = self.get_2d_field(field, grid_2d, units, time=-1)
             val        = _subtract_field_results(val_finite, val_eq)
@@ -378,9 +422,8 @@ class SimulationAdapter:
             else:
                 data["2d_fields"][field] = val
 
-        grid_3d   = config.get("perturbation_3d_grid", config.get("3d_grid", GridSpec("rectangular", (64, 16, 64))))
-        fields_3d = expand_request(config.get("mode_3d_fields"), AVAILABLE_3D_FIELDS)
-        for field in fields_3d:
+        grid_3d = self._grid_spec(config, 3)
+        for field in sel["3d_fields"]:
             val_finite = self.get_mode_3d_field(mode_dir, field, grid_3d, units)
             val_eq     = self.get_3d_field(field, grid_3d, units, time=-1)
             val        = _subtract_field_results(val_finite, val_eq)
@@ -389,9 +432,6 @@ class SimulationAdapter:
             else:
                 data["3d_fields"][field] = val
 
-        # Poloidal spectra are only added when explicitly requested
-        # (config['mode_spectra']), so the output of existing configurations
-        # is unchanged.
         spectra = self._extract_mode_spectra(mode_dir, config)
         if spectra:
             data["spectra"] = spectra

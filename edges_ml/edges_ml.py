@@ -16,17 +16,33 @@ Remote data access (ADIOS2 campaign archives) lives in:
 
     edges_ml/campaign.py
 
-Perturbation output
--------------------
+Export selection
+----------------
+The quantities to export are configured per section; every section has the
+same three lists:
+
+    "equilibrium":   {"flux_averages": [...], "2d_fields": [...], "3d_fields": [...]},
+    "total_fields":  {"flux_averages": [...], "2d_fields": [...], "3d_fields": [...]},
+    "perturbations": {"flux_averages": [...], "2d_fields": [...], "3d_fields": [...],
+                      "spectrum": {"fcoords": "pest", "points": 200, "phi": 0.0,
+                                   "store_fluxgrid": False}},
+
+A poloidal spectrum is computed for every scalar field listed under
+'perturbations' (in any of the three lists).  There is no separate list of
+spectrum quantities.  All 2D / 3D fields use '2d_grid' / '3d_grid'.
+
+Output layout of a perturbation entry:
+    perturbations/<entry>/mode_information
+    perturbations/<entry>/flux_averages
+    perturbations/<entry>/2d_fields
+    perturbations/<entry>/3d_fields
+    perturbations/<entry>/spectra/<field>/{psi_norm, m, amplitude, ...}
+
 Every mode directory is expanded into one or more perturbation entries by
 adapter.extract_mode_entries().  M3D-C1 produces one entry per directory;
 NIMROD produces one entry per toroidal mode stored in the dump (single-n and
 multi-n runs).  If an entry name is already taken (e.g. the same n in several
 directories), the entry is written as '<dir>_<entry>' instead.
-
-Poloidal spectra (config key 'mode_spectra') are written to
-    perturbations/<entry>/spectra/<field>/{psi_norm, m, amplitude, ...}
-with the spectrum metadata stored as group attributes.
 """
 
 import os
@@ -47,6 +63,7 @@ from .utils import (
     expand_request, GridSpec,
     generate_unique_filename,
     brief_error,
+    normalize_export_config, export_selection,
     FIELD_LABELS, FLUX_AVERAGE_LABELS, FLUX_AVERAGE_ONLY_LABELS,
     TIME_TRACE_LABELS,
     FIELD_UNITS_CODE, FLUX_AVERAGE_ONLY_UNITS_CODE, TIME_TRACE_UNITS_CODE,
@@ -185,6 +202,15 @@ def _safe_mode_entries(adapter, mode_dir, config):
         return []
 
 
+def _selection_metadata(config):
+    """Metadata entries that record which perturbation quantities were exported."""
+    sel = export_selection(config)
+    return {
+        "perturbation_quantities": ",".join(sel["perturbation_quantities"]),
+        "spectrum_quantities":     ",".join(sel["spectra"]),
+    }
+
+
 # ===========================================================================
 # DIRECTORY DISCOVERY
 # ===========================================================================
@@ -316,6 +342,9 @@ def build_dataset(sources, output_directory, config):
     output_directory = Path(output_directory)
     output_directory.mkdir(parents=True, exist_ok=True)
 
+    # Resolve (and validate) the export selection once for all adapters.
+    config = normalize_export_config(config)
+
     include_inputs = config.get("include_input_namelist", False)
     output_format  = config.get("output_format", "reduced_h5")
 
@@ -405,6 +434,7 @@ def build_dataset(sources, output_directory, config):
             metadata["units"]         = config.get("units", "codeunits")
             metadata["fcoords"]       = config.get("fcoords", "pest")
             metadata["output_format"] = output_format
+            metadata.update(_selection_metadata(config))
 
             grids        = adapter.extract_grids(config)
             equilibrium  = adapter.extract_equilibrium(config)
@@ -470,7 +500,7 @@ def build_dataset(sources, output_directory, config):
                         grp_mode      = grp_modes.create_group(name)
                         grp_mode_meta = grp_mode.create_group("mode_information")
                         write_dict_as_datasets(grp_mode_meta, entry_meta)
-                        write_array_group(grp_mode, "1d_profiles", mode_data.get("1d_profiles", {}),
+                        write_array_group(grp_mode, "flux_averages", mode_data.get("flux_averages", {}),
                                           unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)
                         write_array_group(grp_mode, "2d_fields", mode_data.get("2d_fields", {}),
                                           unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)
@@ -502,6 +532,7 @@ def build_dataset(sources, output_directory, config):
             metadata["units"]         = config.get("units", "codeunits")
             metadata["fcoords"]       = config.get("fcoords", "pest")
             metadata["output_format"] = output_format
+            metadata.update(_selection_metadata(config))
 
             grids        = adapter.extract_grids(config)
             equilibrium  = adapter.extract_equilibrium(config)
@@ -603,7 +634,7 @@ def build_dataset(sources, output_directory, config):
 
                         base = f"perturbations/{name}"
                         write_adios_recursive(fh, entry_meta, f"{base}/mode_information")
-                        write_adios_recursive(fh, mode_data.get("1d_profiles", {}), f"{base}/1d_profiles",
+                        write_adios_recursive(fh, mode_data.get("flux_averages", {}), f"{base}/flux_averages",
                                               unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)
                         write_adios_recursive(fh, mode_data.get("2d_fields", {}), f"{base}/2d_fields",
                                               unit_mapping=master_unit_mapping, desc_mapping=master_desc_mapping)

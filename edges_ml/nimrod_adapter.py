@@ -22,9 +22,18 @@ Each toroidal mode in the dump becomes its own 'perturbations/nXX' entry
 EvalNimrod.eval_comp_field(), so single-n and multi-n runs are treated
 identically and no subtraction of two full fields is needed.
 
-Poloidal spectra (config key 'mode_spectra') are computed on flux-aligned
-(PEST / Boozer / Hamada) coordinates of the equilibrium, built by
-edges_ml.nimrod_fluxcoords (a port of M3D-C1's flux_coordinates()).
+For every quantity listed under config['perturbations'] the adapter writes
+    * flux averages:  <field>(last dump, eq + n=0 perturbation) - <field>(equilibrium).
+                      The flux-surface average of an n>0 component vanishes,
+                      so this n=0 profile modification is the same for every
+                      toroidal-mode entry of a directory.
+    * 2D / 3D fields: 2 Re[c_n e^{i n phi}] on '2d_grid' / '3d_grid'
+                      (the same grids as all other fields).
+    * poloidal spectra of the scalar fields, computed on flux-aligned
+      (PEST / Boozer / Hamada) coordinates of the equilibrium, built by
+      edges_ml.nimrod_fluxcoords (a port of M3D-C1's flux_coordinates()).
+      The safety factor is not part of the spectrum output; it is available
+      as a flux average.
 """
 
 import os
@@ -70,11 +79,11 @@ from .nimrod_fluxcoords import build_flux_coordinates
 from .utils import (
     printwarn, printerr, printnote,
     compute_file_hash, auto_cast,
-    expand_request, brief_error,
+    brief_error,
+    export_selection,
     spectrum_settings, poloidal_spectrum, parse_toroidal_mode_number,
     GridSpec,
     AVAILABLE_FLUX_AVERAGES,
-    AVAILABLE_1D_PROFILES, AVAILABLE_2D_FIELDS, AVAILABLE_3D_FIELDS,
     _infer_machine_and_shot, _allocate_imas_run, _imas_entry_dir,
     _prepare_nimrod2imas_runtime, _nimrod2imas_tool_available,
     _run_nimrod2imas_tool, _options_dict_to_cli,
@@ -1108,12 +1117,9 @@ class NIMRODAdapter(SimulationAdapter):
         include_n0 = bool(self._config.get("nimrod_include_n0_mode", False))
         growth = self._get_nimgrowth_for_dir(mode_dir)
 
-        # 1D profiles describe the directory (not a single mode); compute once.
-        res_1d = self._config.get("resolutions", {}).get("1d", 200)
-        units = self._config.get("units", "codeunits")
-        profiles = {}
-        for field in expand_request(self._config.get("mode_1d_profiles"), AVAILABLE_1D_PROFILES):
-            profiles[field] = self.get_mode_1d_profile(mode_dir, field, res_1d, units)
+        # Perturbation flux averages describe the n=0 profile modification of
+        # the directory (n>0 components average to zero); compute once.
+        flux_avgs = self._extract_mode_flux_averages(mode_dir, self._config)
 
         entries = []
         for imode, n in table:
@@ -1126,7 +1132,7 @@ class NIMRODAdapter(SimulationAdapter):
                 "frequency":   0.0,
                 "mode_type":   -100,
             }
-            data = self._extract_single_mode(mode_dir, dump_file, imode, n, meta, profiles)
+            data = self._extract_single_mode(mode_dir, dump_file, imode, n, meta, flux_avgs)
             entries.append((f"n{n:02d}", meta, data))
 
         if not entries:
@@ -1134,27 +1140,32 @@ class NIMRODAdapter(SimulationAdapter):
                       "(only n=0 present; set nimrod_include_n0_mode to export it).")
         return entries
 
-    def _extract_single_mode(self, mode_dir, dump_file, imode, n, meta, profiles):
-        """Mode data (2D/3D fields and spectra) for a single toroidal mode."""
+    def _extract_single_mode(self, mode_dir, dump_file, imode, n, meta, flux_avgs):
+        """
+        Perturbation data of a single toroidal mode for every quantity listed
+        under config['perturbations']: flux averages, 2D / 3D fields (on the
+        same grids as all other fields) and the poloidal spectra.
+        """
         cfg = self._config or {}
+        pert = export_selection(cfg)["perturbations"]
         data = {
             "mode_information": dict(meta),
-            "1d_profiles": dict(profiles),
+            "flux_averages": dict(flux_avgs),
             "2d_fields": {},
             "3d_fields": {},
         }
         store_complex = bool(cfg.get("nimrod_store_complex", False))
 
-        grid_2d = cfg.get("perturbation_2d_grid", cfg.get("2d_grid", GridSpec("rectangular", (128, 128))))
-        for field in expand_request(cfg.get("mode_2d_fields"), AVAILABLE_2D_FIELDS):
+        grid_2d = self._grid_spec(cfg, 2)
+        for field in pert["2d_fields"]:
             val = self._mode_fields_on_grid(field, grid_2d, dump_file, imode, n, False, store_complex)
             if isinstance(val, dict):
                 data["2d_fields"].update(val)
             else:
                 data["2d_fields"][field] = val
 
-        grid_3d = cfg.get("perturbation_3d_grid", cfg.get("3d_grid", GridSpec("rectangular", (64, 16, 64))))
-        for field in expand_request(cfg.get("mode_3d_fields"), AVAILABLE_3D_FIELDS):
+        grid_3d = self._grid_spec(cfg, 3)
+        for field in pert["3d_fields"]:
             val = self._mode_fields_on_grid(field, grid_3d, dump_file, imode, n, True, store_complex)
             if isinstance(val, dict):
                 data["3d_fields"].update(val)
@@ -1280,8 +1291,12 @@ class NIMRODAdapter(SimulationAdapter):
         The real eigenfunction in the M3D-C1 toroidal-angle convention is
             g(theta, psi) = 2 Re[conj(c_n) e^{i n phi}],  phi = zeta_t (- omega)
         where conj() converts NIMROD's toroidal angle direction to M3D-C1's and
-        omega is only applied for Boozer / Hamada if spectrum_include_omega.
+        omega is only applied for Boozer / Hamada if include_omega is set.
         The spectrum is |rfft(g, axis=0, norm='forward')|, as in M3D-C1.
+
+        Returned datasets: psi_norm, m, amplitude[m, psi_norm] (plus the flux
+        grid if 'store_fluxgrid' is enabled).  q is not included; it is
+        available as a flux average.
         """
         if not _NIMPY_EVAL_AVAILABLE:
             return {}
@@ -1344,7 +1359,6 @@ class NIMRODAdapter(SimulationAdapter):
             "psi_norm":  np.asarray(fc.psi_norm, dtype=float),
             "m":         m,
             "amplitude": amplitude,
-            "q":         np.asarray(fc.q, dtype=float),
             "_attrs": {
                 "code":             self.CODE_NAME,
                 "field":            str(field),
@@ -1684,12 +1698,15 @@ class NIMRODAdapter(SimulationAdapter):
     _GLOBAL_FSA_KEYS = ('p', 'Bp', 'Bp2', 'jphi_over_R', 'f')
 
     def _requested_fsa_keys(self):
-        """Integrand keys required by the current configuration."""
+        """
+        Integrand keys required by the flux averages of all three sections
+        (equilibrium, total_fields, perturbations).
+        """
         cfg = self._config or {}
+        sel = export_selection(cfg)
         names = set()
-        for opt in ("flux_averages", "total_flux_averages"):
-            sel = cfg.get(opt, None)
-            names.update(expand_request(sel, AVAILABLE_FLUX_AVERAGES) or [])
+        for section in ("equilibrium", "total_fields", "perturbations"):
+            names.update(sel[section]["flux_averages"])
         if not names:
             names = set(AVAILABLE_FLUX_AVERAGES)
 
@@ -1700,7 +1717,6 @@ class NIMRODAdapter(SimulationAdapter):
         if cfg.get("nimrod_compute_globals", True):
             keys.update(self._GLOBAL_FSA_KEYS)
 
-        # q_profile in the mode section also needs FSA (dvar only).
         return tuple(sorted(keys))
 
     def _fsa_nsurf(self, resolution):
@@ -1781,7 +1797,7 @@ class NIMRODAdapter(SimulationAdapter):
             return dy
 
         printnote(f"NIMROD: running flux surface average on {Path(dump_file).name} "
-                  f"({nsurf} surfaces, {len(keys)} quantities).")
+                  f"({nsurf} surfaces, {len(keys)} quantities, eq={eq}).")
 
         try:
             # FSAInput.d is a class-level global in nimpy; reset it so that a
@@ -1879,6 +1895,13 @@ class NIMRODAdapter(SimulationAdapter):
         if record is None:
             return np.array([]), np.array([])
 
+        return self._flux_average_from_record(record, name, resolution, fcoords)
+
+    def _flux_average_from_record(self, record, name, resolution, fcoords):
+        """
+        Extracts flux average *name* from an FSA record.
+        Returns (grid, values) with values an array or a {component: array} dict.
+        """
         grid, src = self._fsa_grid(record, resolution, fcoords)
         if grid.size == 0:
             return np.array([]), np.array([])
@@ -1902,11 +1925,7 @@ class NIMRODAdapter(SimulationAdapter):
             return grid, interp(dvar[3, :])
 
         # --- radially integrated quantities ----------------------------
-        if low == 'v':
-            # Careful: 'v' is the velocity field, 'V' is the volume.
-            if name == 'V':
-                vol = 2.0 * np.pi * _trapz_profile(dvar[6, :], dvar[2, :])
-                return grid, interp(vol)
+        # Careful: 'v' is the velocity field, 'V' is the volume.
         if name == 'V':
             vol = 2.0 * np.pi * _trapz_profile(dvar[6, :], dvar[2, :])
             return grid, interp(vol)
@@ -1967,25 +1986,44 @@ class NIMRODAdapter(SimulationAdapter):
         )
         return grid, np.array([])
 
-    def get_mode_1d_profile(self, mode_dir, name, resolution, units):
-        """1D radial profiles for a mode directory (currently the q profile)."""
-        if str(name).lower() not in ('q_profile', 'q'):
-            self._warn_field_once(
-                f"mode1d::{name}",
-                f"1D profile '{name}' is not available for NIMROD; skipping."
-            )
+    def get_mode_flux_average(self, mode_dir, name, resolution, units, fcoords):
+        """
+        Flux average of the perturbation of *name* for a mode directory:
+            <field>(last dump, eq + n=0 perturbation) - <field>(equilibrium)
+        interpolated onto the equilibrium 1D grid.
+
+        The flux-surface average of an n>0 component vanishes, so this is the
+        n=0 profile modification of the run; it is shared by all toroidal-mode
+        entries of the directory.
+        """
+        nsurf = self._fsa_nsurf(resolution)
+        eq_dump = self._get_dump_file(-1)
+        mode_dump = self._last_dump_in_dir(mode_dir)
+        if eq_dump is None or mode_dump is None:
             return np.array([])
 
-        dump_file = self._last_dump_in_dir(mode_dir)
-        if dump_file is None:
+        rec_eq = self._get_fsa_record(eq_dump, nsurf, eq=1)
+        rec_md = self._get_fsa_record(mode_dump, nsurf, eq=3)
+        if rec_eq is None or rec_md is None:
             return np.array([])
 
-        record = self._get_fsa_record(dump_file, self._fsa_nsurf(resolution), eq=3)
-        if record is None:
+        g_eq, v_eq = self._flux_average_from_record(rec_eq, name, resolution, fcoords)
+        g_md, v_md = self._flux_average_from_record(rec_md, name, resolution, fcoords)
+        if np.size(g_eq) == 0 or np.size(g_md) == 0:
             return np.array([])
 
-        fcoords = (self._config or {}).get("fcoords", "pest")
-        return self._interp_to_grid(record, record['dvar'][7, :], resolution, fcoords)
+        def diff(a, b):
+            a = np.asarray(a, dtype=float)
+            b = np.asarray(b, dtype=float)
+            if a.size < 2 or a.size != np.size(g_md) or b.size != np.size(g_eq):
+                return np.array([])
+            return np.interp(g_eq, g_md, a) - b
+
+        if isinstance(v_md, dict) and isinstance(v_eq, dict):
+            return {k: diff(v_md[k], v_eq[k]) for k in v_md if k in v_eq}
+        if isinstance(v_md, dict) or isinstance(v_eq, dict):
+            return np.array([])
+        return diff(v_md, v_eq)
 
     # ======================================================================
     # GLOBAL PARAMETERS (mirrors nimpy.globaleq without its yaml side effects)

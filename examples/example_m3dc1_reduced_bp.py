@@ -1,41 +1,61 @@
+"""
+Example: export M3D-C1 data into the reduced ADIOS2 (.bp) format.
+
+Every section (equilibrium, total_fields, perturbations) has the same three
+lists: 'flux_averages', '2d_fields' and '3d_fields'.  A poloidal spectrum is
+computed for every scalar field listed under 'perturbations'.
+"""
+
 import edges_ml
 
 config = {
-    "units": "mks", # Options are 'mks', 'cgs', or 'codeunits'
-    "fcoords": "pest", # Options are 'pest', 'boozer', 'hamada', 'canonical', 'geometric'
-    
-    # Determine the time slices for which data is exported (e.g., [0, 1, 20])
+    "units": "mks",          # 'mks', 'cgs' or 'codeunits'
+    "fcoords": "pest",       # 'pest', 'boozer', 'hamada', 'canonical', 'geometric'
+
+    # Time slices for which the total fields are exported (e.g. [0, 1, 20])
     "time_slices": [2],
 
     "resolutions": {
         "1d": 600
     },
-    
-    # Choose equilibrium quantities to export
-    "2d_fields": [],
-    "3d_fields": [],
-    "flux_averages": "all",
-    
-    # Choose time traces (1D scalars) to export
-    "time_traces": [],
-    
-    # Choose total fields on spatial grid to export
-    "total_flux_averages": ['p', 'q', 'j'],
-    "total_2d_fields": ["B", "p"],
-    "total_3d_fields": [],
 
-    # Choose perturbed quantities to export (mode structure)
-    "mode_1d_profiles": [],
-    "mode_2d_fields": ["p"],
-    "mode_3d_fields": [],
-    
-    # Grid Specifications
-    "shared_grid_source": "first", # Options: 'first', '/path/to/simulation', or None
+    # Time traces (1D scalars) to export
+    "time_traces": [],
+
+    # Equilibrium quantities
+    "equilibrium": {
+        "flux_averages": "all",
+        "2d_fields": [],
+        "3d_fields": [],
+    },
+
+    # Total fields, evaluated at every entry of 'time_slices'
+    "total_fields": {
+        "flux_averages": ["p", "q", "j"],
+        "2d_fields": ["B", "p"],
+        "3d_fields": [],
+    },
+
+    # Perturbations (mode structure); spectra are computed for 'p'
+    "perturbations": {
+        "flux_averages": [],
+        "2d_fields": ["p"],
+        "3d_fields": [],
+        "spectrum": {
+            "fcoords": "pest",
+            "points": 200,
+            "phi": 0.0,
+            "store_fluxgrid": False,
+        },
+    },
+
+    # Grid specifications (shared by ALL 2D / 3D fields of every section)
+    "shared_grid_source": "first",     # 'first', '/path/to/simulation' or None
     "2d_grid": edges_ml.GridSpec("inside_wall", None),
     "3d_grid": edges_ml.GridSpec("rectangular", (64, 16, 64)),
-    
+
     "include_input_namelist": True,
-    "output_format": 'reduced_bp', # Options are 'reduced_h5', 'reduced_bp', 'imas_h5'
+    "output_format": "reduced_bp",     # 'reduced_h5', 'reduced_bp', 'imas_h5'
 }
 
 # Explicit mapping of source directories to their underlying codes
@@ -50,9 +70,9 @@ data_sources = [
     }
 ]
 
-# Run the workflow
-edges_ml.build_dataset(
-    sources=data_sources,
-    output_directory="./datasets",
-    config=config
-)
+if __name__ == "__main__":
+    edges_ml.build_dataset(
+        sources=data_sources,
+        output_directory="./datasets",
+        config=config
+    )

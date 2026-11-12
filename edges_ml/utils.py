@@ -335,17 +335,22 @@ FIELD_UNITS_CODE = {k: 'dummy_conversion_formula' for k in FIELD_LABELS.keys()}
 FLUX_AVERAGE_ONLY_UNITS_CODE = {k: 'dummy_conversion_formula' for k in FLUX_AVERAGE_ONLY_LABELS.keys()}
 TIME_TRACE_UNITS_CODE = {k: 'dummy_conversion_formula' for k in TIME_TRACE_LABELS.keys()}
 
-AVAILABLE_1D_PROFILES   = ["q_profile"]
+AVAILABLE_1D_PROFILES   = ["q_profile"]   # legacy (mode_1d_profiles); mapped onto 'q'
 AVAILABLE_2D_FIELDS     = list(FIELD_LABELS.keys())
 AVAILABLE_3D_FIELDS     = list(FIELD_LABELS.keys())
 AVAILABLE_FLUX_AVERAGES = list(FLUX_AVERAGE_LABELS.keys())
 AVAILABLE_TIME_TRACES   = list(TIME_TRACE_LABELS.keys())
 AVAILABLE_INPUTS        = ["Ip", "Bt"]
 
-# Fields for which a poloidal Fourier spectrum of the mode perturbation can be
-# exported (config key 'mode_spectra').  Only scalar fields are supported for
-# now; vector fields (B, v, ...) are reserved for a future extension.
-AVAILABLE_SPECTRUM_FIELDS = ["p"]
+# Vector quantities (written as <name>_R / <name>_phi / <name>_Z).  Poloidal
+# spectra are only implemented for scalar quantities.
+VECTOR_FIELDS = frozenset({"B", "b", "v", "j", "J", "A", "gradA", "E", "e"})
+
+# Quantities for which a poloidal spectrum of the perturbation can be computed:
+# every scalar field (flux-surface-only quantities such as q have no poloidal
+# structure).  The spectra are computed automatically for every quantity
+# listed under config['perturbations'] that is in this list.
+AVAILABLE_SPECTRUM_FIELDS = [k for k in FIELD_LABELS.keys() if k not in VECTOR_FIELDS]
 
 
 # ===========================================================================
@@ -388,6 +393,15 @@ def expand_request(selection, registry):
             return list(registry)
 
     return items
+
+
+def unique_names(seq):
+    """Order-preserving de-duplication of a sequence of names."""
+    out = []
+    for s in seq:
+        if s not in out:
+            out.append(s)
+    return out
 
 
 def summarize_names(names, max_shown=8):
@@ -528,21 +542,42 @@ def normalize_fcoords(fcoords):
 
 def spectrum_settings(config):
     """
-    Collects all poloidal-spectrum related configuration options.
+    Collects all poloidal-spectrum related settings.
 
-    The spectrum feature is OFF unless config['mode_spectra'] is set.
+    The spectrum QUANTITIES are not configurable separately: a spectrum is
+    computed for every (scalar field) quantity listed under
+    config['perturbations'] (see export_selection()).
+
+    The numerical settings are read from config['perturbations']['spectrum']
+    (preferred) or from the legacy flat keys 'spectrum_<name>':
+        fcoords, points, phi, include_omega, store_fluxgrid, theta_oversample
     """
     cfg = config or {}
-    fields = expand_request(cfg.get("mode_spectra"), AVAILABLE_SPECTRUM_FIELDS)
-    fc_raw = cfg.get("spectrum_fcoords", cfg.get("fcoords", "pest"))
+    sel = export_selection(cfg)
+
+    pert = cfg.get("perturbations")
+    spec = pert.get(SPECTRUM_KEY) if isinstance(pert, dict) else None
+    if not isinstance(spec, dict):
+        spec = {}
+
+    def opt(name, default):
+        if name in spec:
+            return spec[name]
+        return cfg.get(f"spectrum_{name}", default)
+
+    if "fcoords" in spec:
+        fc_raw = spec["fcoords"]
+    else:
+        fc_raw = cfg.get("spectrum_fcoords", cfg.get("fcoords", "pest"))
+
     return {
-        "fields":           list(fields),
-        "points":           int(cfg.get("spectrum_points", 200)),
+        "fields":           list(sel["spectra"]),
+        "points":           int(opt("points", 200)),
         "fcoords":          normalize_fcoords(fc_raw),
-        "phi":              float(cfg.get("spectrum_phi", 0.0)),
-        "include_omega":    bool(cfg.get("spectrum_include_omega", False)),
-        "store_fluxgrid":   bool(cfg.get("spectrum_store_fluxgrid", False)),
-        "theta_oversample": max(1, int(cfg.get("spectrum_theta_oversample", 1))),
+        "phi":              float(opt("phi", 0.0)),
+        "include_omega":    bool(opt("include_omega", False)),
+        "store_fluxgrid":   bool(opt("store_fluxgrid", False)),
+        "theta_oversample": max(1, int(opt("theta_oversample", 1))),
         "units":            str(cfg.get("units", "codeunits")),
     }
 
@@ -591,6 +626,181 @@ def parse_toroidal_mode_number(name):
     if m:
         return int(m.group(1))
     return None
+
+
+# ===========================================================================
+# EXPORT SELECTION (equilibrium / total_fields / perturbations)
+# ===========================================================================
+#
+# The quantities to export are configured per section, with the same three
+# lists in every section:
+#
+#     "equilibrium":   {"flux_averages": [...], "2d_fields": [...], "3d_fields": [...]},
+#     "total_fields":  {"flux_averages": [...], "2d_fields": [...], "3d_fields": [...]},
+#     "perturbations": {"flux_averages": [...], "2d_fields": [...], "3d_fields": [...],
+#                       "spectrum": {"fcoords": "pest", "points": 200, ...}},
+#
+# A poloidal spectrum is computed for EVERY quantity listed under
+# 'perturbations' (in any of the three lists), as long as it is a scalar field.
+# There is no separate list of spectrum quantities.
+# ---------------------------------------------------------------------------
+
+EXPORT_SECTIONS = ("equilibrium", "total_fields", "perturbations")
+EXPORT_KINDS = ("flux_averages", "2d_fields", "3d_fields")
+SPECTRUM_KEY = "spectrum"
+
+_EXPORT_CACHE_KEY = "_export_selection"
+
+# Old flat configuration keys and the (section, kind) they map onto.
+_LEGACY_EXPORT_KEYS = {
+    ("equilibrium",   "flux_averages"): "flux_averages",
+    ("equilibrium",   "2d_fields"):     "2d_fields",
+    ("equilibrium",   "3d_fields"):     "3d_fields",
+    ("total_fields",  "flux_averages"): "total_flux_averages",
+    ("total_fields",  "2d_fields"):     "total_2d_fields",
+    ("total_fields",  "3d_fields"):     "total_3d_fields",
+    ("perturbations", "flux_averages"): "mode_1d_profiles",
+    ("perturbations", "2d_fields"):     "mode_2d_fields",
+    ("perturbations", "3d_fields"):     "mode_3d_fields",
+}
+
+# Old keys that no longer have any effect.
+_LEGACY_IGNORED_KEYS = {
+    "mode_spectra": "spectra are computed for every quantity listed under 'perturbations'",
+    "perturbation_2d_grid": "perturbations always use '2d_grid' (same grid as all other fields)",
+    "perturbation_3d_grid": "perturbations always use '3d_grid' (same grid as all other fields)",
+}
+
+_NAME_ALIASES = {"q_profile": "q"}
+
+
+def _kind_registry(kind):
+    if kind == "flux_averages":
+        return AVAILABLE_FLUX_AVERAGES
+    if kind == "2d_fields":
+        return AVAILABLE_2D_FIELDS
+    return AVAILABLE_3D_FIELDS
+
+
+def _resolve_names(raw, kind, label, verbose):
+    """Expands 'all', applies aliases and de-duplicates a quantity list."""
+    registry = _kind_registry(kind)
+    names = []
+    for item in expand_request(raw, registry):
+        name = _NAME_ALIASES.get(str(item), str(item))
+        if name not in registry and verbose:
+            printwarn(f"'{name}' in '{label}' is not a known quantity; "
+                      "it is passed to the adapter anyway.")
+        names.append(name)
+    return unique_names(names)
+
+
+def _format_names(names):
+    if not names:
+        return "-"
+    if len(names) > 8:
+        return f"{len(names)} quantities ({', '.join(names[:5])}, ...)"
+    return ", ".join(names)
+
+
+def _build_export_selection(cfg, verbose=False):
+    sel = {}
+    legacy_used = []
+
+    for section in EXPORT_SECTIONS:
+        block = cfg.get(section)
+        if block is not None and not isinstance(block, dict):
+            if verbose:
+                printwarn(f"Config key '{section}' must be a dictionary with the keys "
+                          f"{list(EXPORT_KINDS)}; ignored.")
+            block = None
+
+        sel[section] = {}
+        for kind in EXPORT_KINDS:
+            legacy_key = _LEGACY_EXPORT_KEYS[(section, kind)]
+            if block is not None:
+                raw = block.get(kind)
+                if verbose and cfg.get(legacy_key):
+                    printwarn(f"Legacy key '{legacy_key}' is ignored because "
+                              f"'{section}' is given.")
+            else:
+                raw = cfg.get(legacy_key)
+                if raw:
+                    legacy_used.append(legacy_key)
+            sel[section][kind] = _resolve_names(raw, kind, f"{section}/{kind}", verbose)
+
+        if block is not None and verbose:
+            allowed = set(EXPORT_KINDS)
+            if section == "perturbations":
+                allowed.add(SPECTRUM_KEY)
+            unknown = [k for k in block if k not in allowed]
+            if unknown:
+                printwarn(f"Unknown key(s) {unknown} in '{section}' ignored "
+                          f"(allowed: {sorted(allowed)}).")
+
+    if verbose:
+        if legacy_used:
+            printwarn(
+                f"The configuration keys {legacy_used} are deprecated. Use the sections "
+                "'equilibrium', 'total_fields' and 'perturbations', each with the lists "
+                "'flux_averages', '2d_fields' and '3d_fields'."
+            )
+        for key, reason in _LEGACY_IGNORED_KEYS.items():
+            if key in cfg:
+                printwarn(f"Config key '{key}' has no effect any more: {reason}.")
+
+    pert = sel["perturbations"]
+    quantities = unique_names(pert["flux_averages"] + pert["2d_fields"] + pert["3d_fields"])
+    spectra = [q for q in quantities if q in FIELD_LABELS and q not in VECTOR_FIELDS]
+    sel["perturbation_quantities"] = quantities
+    sel["spectra"] = spectra
+
+    if verbose:
+        printnote("Export selection:")
+        for section in EXPORT_SECTIONS:
+            parts = [f"{kind}: {_format_names(sel[section][kind])}" for kind in EXPORT_KINDS]
+            printnote(f"  {section:<14s} " + " | ".join(parts))
+        printnote(f"  {'spectra':<14s} {_format_names(spectra)}")
+        skipped = [q for q in quantities if q not in spectra]
+        if skipped:
+            printnote(f"  (no poloidal spectrum for {skipped}: vector or "
+                      "flux-surface-only quantities)")
+        tot = sel["total_fields"]
+        if any(tot[k] for k in EXPORT_KINDS) and not cfg.get("time_slices"):
+            printwarn("'total_fields' are requested but 'time_slices' is empty; "
+                      "no total fields will be written.")
+
+    return sel
+
+
+def export_selection(config):
+    """
+    Returns the resolved export selection:
+        {
+          "equilibrium":   {"flux_averages": [...], "2d_fields": [...], "3d_fields": [...]},
+          "total_fields":  {...},
+          "perturbations": {...},
+          "perturbation_quantities": [...],   # union of the perturbation lists
+          "spectra": [...],                   # quantities that get a spectrum
+        }
+    Uses the cached result of normalize_export_config() when available.
+    """
+    cfg = config or {}
+    cached = cfg.get(_EXPORT_CACHE_KEY)
+    if isinstance(cached, dict):
+        return cached
+    return _build_export_selection(cfg, verbose=False)
+
+
+def normalize_export_config(config):
+    """
+    Returns a copy of *config* with the resolved export selection attached
+    (validated once, with warnings and a summary printed).
+    """
+    cfg = dict(config or {})
+    cfg.pop(_EXPORT_CACHE_KEY, None)
+    cfg[_EXPORT_CACHE_KEY] = _build_export_selection(cfg, verbose=True)
+    return cfg
 
 
 # ===========================================================================

@@ -1,50 +1,66 @@
+"""
+Example: export equilibrium, total and perturbed quantities from local M3D-C1
+runs into the reduced HDF5 format.
+
+Every section (equilibrium, total_fields, perturbations) has the same three
+lists: 'flux_averages', '2d_fields' and '3d_fields'.  A poloidal spectrum is
+computed for every scalar field listed under 'perturbations' (in any of the
+three lists); there is no separate list of spectrum quantities.
+"""
+
 import edges_ml
 
 config = {
-    "units": "mks", # Options are 'mks', 'cgs', or 'codeunits'
-    "fcoords": "pest", # Options are 'pest', 'boozer', 'hamada', 'canonical', 'geometric'
-    
-    # Determine the time slices for which data is exported (e.g., [0, 1, 20])
+    "units": "mks",          # 'mks', 'cgs' or 'codeunits'
+    "fcoords": "pest",       # 'pest', 'boozer', 'hamada', 'canonical', 'geometric'
+
+    # Time slices for which the total fields are exported (e.g. [0, 1, 20])
     "time_slices": [2],
 
     "resolutions": {
         "1d": 200
     },
-    
-    # Choose equilibrium quantities to export
-    "2d_fields": ["te", "ne"],
-    "3d_fields": [],
-    "flux_averages": "all",
-    
-    # Choose time traces (1D scalars) to export
+
+    # Time traces (1D scalars) to export
     "time_traces": ["all"],
-    
-    # Choose total fields on spatial grid to export
-    "total_flux_averages": [],
-    "total_2d_fields": ["te", "ne"],
-    "total_3d_fields": [],
 
-    # Choose perturbed quantities to export (mode structure)
-    "mode_1d_profiles": [],
-    "mode_2d_fields": ["B"],
-    "mode_3d_fields": [],
+    # Equilibrium quantities
+    "equilibrium": {
+        "flux_averages": "all",
+        "2d_fields": ["te", "ne"],
+        "3d_fields": [],
+    },
 
-    # Poloidal Fourier spectra of the mode eigenfunctions
+    # Total fields, evaluated at every entry of 'time_slices'
+    "total_fields": {
+        "flux_averages": [],
+        "2d_fields": ["te", "ne"],
+        "3d_fields": [],
+    },
+
+    # Perturbations (mode structure).  The poloidal spectrum is computed for
+    # every scalar quantity listed here
     # (same algorithm as m3dc1.eigenfunction.eigenfunction(fourier=True)).
-    # Written to /perturbations/<nXX>/spectra/<field>/. Omit 'mode_spectra' to disable.
-    "mode_spectra": ["p"],             # currently only 'p' is supported
-    "spectrum_fcoords": "pest",        # 'pest' (default), 'boozer', 'hamada'; '' = geometric (fallback only)
-    "spectrum_points": 200,            # number of theta AND psi points
-    "spectrum_phi": 0.0,               # toroidal angle at which the eigenfunction is evaluated
-    "spectrum_store_fluxgrid": True,   # also store eigenfunction[theta, psi], R, Z, theta
-    
-    # Grid Specifications
-    "shared_grid_source": "first", # Options: 'first', '/path/to/simulation', or None
+    # Written to /perturbations/<nXX>/spectra/<field>/.
+    "perturbations": {
+        "flux_averages": [],
+        "2d_fields": ["p"],
+        "3d_fields": [],
+        "spectrum": {                  # numerical settings only, no quantity list
+            "fcoords": "pest",         # 'pest' (default), 'boozer', 'hamada'; '' = geometric
+            "points": 200,             # number of theta AND psi points
+            "phi": 0.0,                # toroidal angle of the eigenfunction
+            "store_fluxgrid": True,    # also store eigenfunction[theta, psi], R, Z, theta
+        },
+    },
+
+    # Grid specifications (shared by ALL 2D / 3D fields of every section)
+    "shared_grid_source": "first",     # 'first', '/path/to/simulation' or None
     "2d_grid": edges_ml.GridSpec("inside_wall", None),
     "3d_grid": edges_ml.GridSpec("rectangular", (64, 16, 64)),
-    
+
     "include_input_namelist": True,
-    "output_format": 'reduced_h5', # Options are 'reduced_h5', 'reduced_bp', 'imas_h5'
+    "output_format": "reduced_h5",     # 'reduced_h5', 'reduced_bp', 'imas_h5'
 }
 
 # Source directories for each code
@@ -61,9 +77,9 @@ data_sources = [
     }
 ]
 
-# Run the workflow
-edges_ml.build_dataset(
-    sources=data_sources,
-    output_directory="./datasets",
-    config=config
-)
+if __name__ == "__main__":
+    edges_ml.build_dataset(
+        sources=data_sources,
+        output_directory="./datasets",
+        config=config
+    )

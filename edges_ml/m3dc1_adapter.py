@@ -40,8 +40,16 @@ them are handled here:
     pre-filtered against what the simulation really contains, and any remaining
     failure is reported with utils.brief_error() as a single short line.
 
-Poloidal mode spectra (config key 'mode_spectra') are computed by
-get_mode_spectrum(), a port of the numerical core of
+Perturbations
+-------------
+For every quantity listed under config['perturbations'] the adapter provides
+    * flux averages:  <field>(mode sim, time='last') - <field>(equilibrium),
+                      both on the equilibrium flux surfaces
+                      (get_mode_flux_average),
+    * 2D / 3D fields: field(mode sim) - field(equilibrium) (base.extract_mode),
+    * poloidal spectra (get_mode_spectrum) for scalar fields.
+
+get_mode_spectrum() is a port of the numerical core of
 m3dc1.eigenfunction.eigenfunction(fourier=True) that is safe with respect to
 the shared state listed above:
     * flux_coordinates() is called with an explicit flux coordinate system,
@@ -51,6 +59,8 @@ the shared state listed above:
     * the toroidal mode number is taken from the directory name, never from a
       parameter file (which is not available in campaign mode);
     * the unit conversion uses the actual field name instead of 'p'.
+The safety factor is not part of the spectrum output; it is available as a
+flux average.
 """
 
 import os
@@ -100,6 +110,7 @@ from .utils import (
     brief_error, is_missing_error, summarize_names,
     poloidal_spectrum,
     GridSpec,
+    _subtract_field_results,
     _infer_machine_and_shot, _allocate_imas_run, _imas_entry_dir,
 )
 
@@ -742,13 +753,22 @@ class M3DC1Adapter(SimulationAdapter):
 
     def get_flux_average(self, name, resolution, units, fcoords, time=-1, use_eq_fs=True):
         """
-        Utilizes the imported flux_average function on the equilibrium sim.
+        Utilizes the imported flux_average function on the equilibrium sim
+        (time=-1) or on the sim of the requested time slice.
         Returns a tuple of (normalized_flux_array, values_array) as 1D numpy arrays.
         """
         sim = self._get_eq_sim() if time == -1 else self._get_time_sim(time)
         if sim is None:
             return np.array([]), np.array([])
+        return self._flux_average_on_sim(sim, name, resolution, units, fcoords,
+                                         time, use_eq_fs=use_eq_fs)
 
+    def _flux_average_on_sim(self, sim, name, resolution, units, fcoords, time,
+                             use_eq_fs=True, label=None):
+        """
+        Runs m3dc1's flux_average() for *name* on an arbitrary sim object
+        (equilibrium, time slice or mode simulation).
+        """
         m3dc1_units = self._map_units(units)
         h5_file     = self._h5_filename(sim)
 
@@ -757,7 +777,7 @@ class M3DC1Adapter(SimulationAdapter):
 
         # Remote data: reuse the equilibrium flux coordinates instead of
         # letting flux_average() rebuild them from the (unreadable) archive.
-        if self.is_campaign and time != -1 and use_eq_fs:
+        if self.is_campaign and use_eq_fs and sim is not self._eq_sim:
             self._attach_equilibrium_fc(sim, resolution, units, fcoords)
             self._sync_timeslice(sim)
 
@@ -788,7 +808,8 @@ class M3DC1Adapter(SimulationAdapter):
                                          units=m3dc1_units, coord='scalar')
                 return np.asarray(nflux), np.asarray(fa)
         except Exception as e:
-            msg = f"Flux average '{name}' (time={time}) failed: {brief_error(e)}"
+            where = label or f"time={time}"
+            msg = f"Flux average '{name}' ({where}) failed: {brief_error(e)}"
             if is_missing_error(e):
                 printwarn(msg)
             else:
@@ -904,8 +925,24 @@ class M3DC1Adapter(SimulationAdapter):
 
         return meta
 
-    def get_mode_1d_profile(self, mode_dir, name, resolution, units):
-        return np.zeros(resolution)
+    def get_mode_flux_average(self, mode_dir, name, resolution, units, fcoords):
+        """
+        Flux average of the perturbation of *name*:
+            <field>(mode sim, time='last') - <field>(equilibrium, time=-1)
+        Both averages are taken on the equilibrium flux surfaces, so the
+        result lives on the equilibrium 1D grid ('grids/1d_grid').
+        """
+        mode = self._get_mode_sim(mode_dir)
+        if mode is None:
+            return np.array([])
+
+        _, f_mode = self._flux_average_on_sim(
+            mode, name, resolution, units, fcoords,
+            time=self._sim_time(mode), use_eq_fs=True,
+            label=f"{Path(mode_dir).name}, time='last'",
+        )
+        _, f_eq = self.get_flux_average(name, resolution, units, fcoords, time=-1)
+        return _subtract_field_results(f_mode, f_eq)
 
     def get_mode_2d_mesh(self, mode_dir, grid_spec):
         return self.get_2d_mesh(grid_spec)
@@ -1037,6 +1074,10 @@ class M3DC1Adapter(SimulationAdapter):
         geometric toroidal angle phi = settings['phi'], exactly as in
         m3dc1.eigenfunction.eigenfunction(fourier=True):
             amplitude = |rfft(ef, axis=0, norm='forward')|
+
+        Returned datasets: psi_norm, m, amplitude[m, psi_norm] (plus the flux
+        grid if 'store_fluxgrid' is enabled).  q is not included; it is
+        available as a flux average.
         """
         if not (_M3DC1_AVAILABLE and _M3DC1_SPECTRUM_AVAILABLE):
             self._warn_spectrum_once(
@@ -1049,7 +1090,7 @@ class M3DC1Adapter(SimulationAdapter):
         if settings.get("include_omega"):
             self._warn_spectrum_once(
                 "omega",
-                "spectrum_include_omega is not implemented for M3D-C1; spectra are "
+                "spectrum include_omega is not implemented for M3D-C1; spectra are "
                 "evaluated at constant geometric toroidal angle (as in eigenfunction())."
             )
 
@@ -1141,9 +1182,6 @@ class M3DC1Adapter(SimulationAdapter):
                 "theta_convention": "theta=0 outboard midplane, clockwise in (R,Z)",
             },
         }
-        q = getattr(fc, 'q', None)
-        if q is not None:
-            out["q"] = np.asarray(q, dtype=float)
         if settings.get("store_fluxgrid"):
             out["eigenfunction"] = ef
             out["R"] = rpath
