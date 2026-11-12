@@ -34,6 +34,15 @@ For every quantity listed under config['perturbations'] the adapter writes
       edges_ml.nimrod_fluxcoords (a port of M3D-C1's flux_coordinates()).
       The safety factor is not part of the spectrum output; it is available
       as a flux average.
+
+Current density
+---------------
+The current density 'j' can only be evaluated if the run wrote it to the
+dump (dump_ja=T in nimrod.in).  Otherwise nimpy aborts the whole process with
+'NIM_STOP => Evaluation of j requires dump_ja=T', which cannot be caught.
+The adapter therefore reads dump_ja from nimrod.in (override with
+config['nimrod_dump_ja']) and skips every quantity that needs 'j'
+(j, Ip, and the Ip-based global parameters) when it is not available.
 """
 
 import os
@@ -179,7 +188,14 @@ class NIMRODAdapter(SimulationAdapter):
 
     # Ordered list of nimpy 'fieldlist' strings to attempt when initialising
     # EvalNimrod.  The first one that initialises successfully is kept.
+    # 'j' is removed from these candidates if the run has dump_ja=F.
     _FIELDLIST_CANDIDATES = ('nvptbje', 'nvptbj', 'nvptb', 'nvpt', 'nvp', 'n')
+
+    # nimpy fields that need the current density in the dump (dump_ja=T).
+    _CURRENT_FIELDS = frozenset({'j'})
+
+    # FSA integrand keys that evaluate the current density.
+    _CURRENT_FSA_KEYS = frozenset({'j', 'j_R', 'j_Z', 'j_phi', 'jphi_over_R'})
 
     # Flux-average names that require no FSA integrand (taken from dvar).
     _FSA_FROM_DVAR = {
@@ -234,6 +250,9 @@ class NIMRODAdapter(SimulationAdapter):
         self._global_params_cache = None
         self._warned_fields = set()
 
+        # dump_ja (current density in the dump) per run directory
+        self._dump_ja_cache = {}
+
         # Per-mode evaluation / spectrum caches
         self._geometry_cache = {}
         self._mode_table_cache = {}
@@ -273,6 +292,98 @@ class NIMRODAdapter(SimulationAdapter):
         self._mode_table_cache.clear()
         self._fluxcoord_cache.clear()
         self._fluxcoord_failed.clear()
+
+    # ======================================================================
+    # CURRENT DENSITY AVAILABILITY (dump_ja)
+    # ======================================================================
+
+    @staticmethod
+    def _read_dump_ja(run_dir):
+        """
+        Reads dump_ja from <run_dir>/nimrod.in.
+
+        Returns True / False, or None if nimrod.in cannot be read.  A missing
+        dump_ja entry means NIMROD's default (F).
+        """
+        nml_file = Path(run_dir) / "nimrod.in"
+        if not nml_file.is_file():
+            return None
+
+        try:
+            import f90nml
+            nml = f90nml.read(str(nml_file))
+            for grp in nml.values():
+                groups = grp if isinstance(grp, list) else [grp]
+                for g in groups:
+                    if isinstance(g, dict) and 'dump_ja' in g:
+                        return bool(g['dump_ja'])
+            return False
+        except Exception:
+            pass
+
+        try:
+            rx = re.compile(r'\bdump_ja\s*=\s*([^\s,/!]+)', re.IGNORECASE)
+            with open(nml_file, 'r', errors='ignore') as f:
+                for line in f:
+                    m = rx.search(line.split('!')[0])
+                    if m:
+                        return m.group(1).strip().strip('.').lower().startswith('t')
+            return False
+        except Exception:
+            return None
+
+    def _current_available(self, dump_file):
+        """
+        True if the current density 'j' can be evaluated for *dump_file*.
+
+        nimpy aborts the process (NIM_STOP, not catchable) if 'j' is evaluated
+        for a run with dump_ja=F, so this must be checked before every request.
+        config['nimrod_dump_ja'] (True/False) overrides the nimrod.in value.
+        """
+        override = (self._config or {}).get("nimrod_dump_ja", None)
+        if override is not None:
+            return bool(override)
+        if dump_file is None:
+            return False
+
+        run_dir = Path(dump_file).resolve().parent
+        if run_dir in self._dump_ja_cache:
+            return self._dump_ja_cache[run_dir]
+
+        value = self._read_dump_ja(run_dir)
+        if value is None:
+            printwarn(f"NIMROD: could not read dump_ja from {run_dir / 'nimrod.in'}; "
+                      "assuming dump_ja=F (current density not available).")
+            value = False
+        if not value:
+            printnote(f"NIMROD: {run_dir.name}/nimrod.in has dump_ja=F. The current "
+                      "density 'j' is not in the dumps; quantities that need it "
+                      "(j, Ip, ...) are skipped. Set dump_ja=T in &output_input to "
+                      "write it (or config['nimrod_dump_ja'] to override).")
+
+        self._dump_ja_cache[run_dir] = value
+        return value
+
+    def _needs_current(self, kind, payload):
+        """True if the resolved field requires the current density."""
+        if kind == 'vector':
+            return payload in self._CURRENT_FIELDS
+        if kind == 'scalar':
+            return payload[0] in self._CURRENT_FIELDS
+        if kind == 'derived':
+            return any(self._needs_current(*self._resolve_field(n)) for n in payload)
+        return False
+
+    def _skip_current_field(self, name, kind, payload, dump_file):
+        """Warns once and returns True if *name* needs 'j' but dump_ja=F."""
+        if self._needs_current(kind, payload) and not self._current_available(dump_file):
+            self._warn_field_once(
+                f"nocurrent::{name}",
+                f"Field '{name}' needs the current density, which is not in the "
+                "NIMROD dumps (dump_ja=F); skipping."
+            )
+            return True
+        return False
 
     # ======================================================================
     # MODE DIRECTORY / DUMP DISCOVERY  (unchanged behaviour)
@@ -679,23 +790,30 @@ class NIMRODAdapter(SimulationAdapter):
         Returns a cached EvalNimrod instance for the given dump file.
 
         The nimpy shared library can only keep one dump file open at a time, so
-        a single active handle is tracked and re-initialised on demand.
+        a single active handle is tracked and re-initialised on demand.  If the
+        run has dump_ja=F, 'j' is removed from the field list.
         """
         if not _NIMPY_EVAL_AVAILABLE or dump_file is None:
             return None
 
         dump_path = Path(dump_file).resolve()
-        requested = fieldlist or self._fieldlist
+        allow_j = self._current_available(dump_file)
 
+        def _strip(fl):
+            return fl if allow_j else fl.replace('j', '')
+
+        requested = fieldlist or self._fieldlist
         if requested is not None:
+            requested = _strip(requested)
             key = (str(dump_path), requested)
             if self._active_eval_key == key and self._active_eval is not None:
                 return self._active_eval
 
-        if requested is not None:
-            candidates = [requested] + [f for f in self._FIELDLIST_CANDIDATES if f != requested]
-        else:
-            candidates = list(self._FIELDLIST_CANDIDATES)
+        candidates = []
+        for fl in ([requested] if requested else []) + list(self._FIELDLIST_CANDIDATES):
+            fl = _strip(fl)
+            if fl and fl not in candidates:
+                candidates.append(fl)
 
         errors = []
         for fl in candidates:
@@ -864,6 +982,9 @@ class NIMRODAdapter(SimulationAdapter):
             )
             return np.array([])
 
+        if self._skip_current_field(name, kind, payload, dump_file):
+            return np.array([])
+
         ev = self._get_eval(dump_file)
         if ev is None:
             return np.array([])
@@ -1006,6 +1127,9 @@ class NIMRODAdapter(SimulationAdapter):
             self._warn_field_once(
                 name, f"Field '{name}' is not available from NIMROD dumps; skipping."
             )
+            return {}
+
+        if self._skip_current_field(name, kind, payload, dump_file):
             return {}
 
         ev = self._get_eval(dump_file)
@@ -1161,7 +1285,7 @@ class NIMRODAdapter(SimulationAdapter):
             val = self._mode_fields_on_grid(field, grid_2d, dump_file, imode, n, False, store_complex)
             if isinstance(val, dict):
                 data["2d_fields"].update(val)
-            else:
+            elif np.size(val) > 0:
                 data["2d_fields"][field] = val
 
         grid_3d = self._grid_spec(cfg, 3)
@@ -1169,7 +1293,7 @@ class NIMRODAdapter(SimulationAdapter):
             val = self._mode_fields_on_grid(field, grid_3d, dump_file, imode, n, True, store_complex)
             if isinstance(val, dict):
                 data["3d_fields"].update(val)
-            else:
+            elif np.size(val) > 0:
                 data["3d_fields"][field] = val
 
         settings = spectrum_settings(cfg)
@@ -1316,12 +1440,14 @@ class NIMRODAdapter(SimulationAdapter):
             )
             return {}
 
-        kind, _ = self._resolve_field(field)
+        kind, payload = self._resolve_field(field)
         if kind not in ('scalar', 'derived'):
             self._warn_field_once(
                 f"spec_vec::{field}",
                 f"Poloidal spectra of non-scalar field '{field}' are not supported yet; skipping."
             )
+            return {}
+        if self._skip_current_field(field, kind, payload, dump_file):
             return {}
 
         fc = self._get_flux_coordinates(dump_file, settings)
@@ -1697,10 +1823,13 @@ class NIMRODAdapter(SimulationAdapter):
 
     _GLOBAL_FSA_KEYS = ('p', 'Bp', 'Bp2', 'jphi_over_R', 'f')
 
-    def _requested_fsa_keys(self):
+    def _requested_fsa_keys(self, dump_file=None):
         """
         Integrand keys required by the flux averages of all three sections
         (equilibrium, total_fields, perturbations).
+
+        Keys that evaluate the current density are dropped if *dump_file*
+        belongs to a run with dump_ja=F.
         """
         cfg = self._config or {}
         sel = export_selection(cfg)
@@ -1714,8 +1843,23 @@ class NIMRODAdapter(SimulationAdapter):
         for n in names:
             keys.update(self._FSA_NAME_TO_KEYS.get(n, ()))
 
-        if cfg.get("nimrod_compute_globals", True):
+        globals_on = bool(cfg.get("nimrod_compute_globals", True))
+        if globals_on:
             keys.update(self._GLOBAL_FSA_KEYS)
+
+        if dump_file is not None and not self._current_available(dump_file):
+            dropped = keys & self._CURRENT_FSA_KEYS
+            if dropped:
+                keys -= self._CURRENT_FSA_KEYS
+                affected = sorted(n for n in names
+                                  if set(self._FSA_NAME_TO_KEYS.get(n, ())) & self._CURRENT_FSA_KEYS)
+                if globals_on:
+                    affected.append("global parameters Ip / beta_n")
+                self._warn_field_once(
+                    "nocurrent::fsa",
+                    "NIMROD: the current density is not in the dumps (dump_ja=F); "
+                    f"flux averages that need it are skipped: {', '.join(affected)}."
+                )
 
         return tuple(sorted(keys))
 
@@ -1770,7 +1914,7 @@ class NIMRODAdapter(SimulationAdapter):
         if not (self._config or {}).get("nimrod_enable_fsa", True):
             return None
 
-        keys = self._requested_fsa_keys()
+        keys = self._requested_fsa_keys(dump_file)
         cache_key = (str(Path(dump_file).resolve()), int(nsurf), int(eq), keys)
         if cache_key in self._fsa_cache:
             return self._fsa_cache[cache_key]
@@ -2107,7 +2251,7 @@ class NIMRODAdapter(SimulationAdapter):
             volume = float(vol_prof[-1]) if vol_prof.size else np.nan
             out['volume'] = _finite(volume)
 
-            # --- plasma current -------------------------------------------
+            # --- plasma current (needs dump_ja=T) -------------------------
             ip = np.nan
             if 'jphi_over_R' in vals:
                 raw = np.asarray(vals['jphi_over_R']) * vprime
