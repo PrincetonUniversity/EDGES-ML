@@ -37,12 +37,18 @@ For every quantity listed under config['perturbations'] the adapter writes
 
 Current density
 ---------------
-The current density 'j' can only be evaluated if the run wrote it to the
-dump (dump_ja=T in nimrod.in).  Otherwise nimpy aborts the whole process with
+The flux-surface averages themselves only need the magnetic field (field-line
+tracing).  The enclosed plasma current I(psi) (flux average 'Ip' and the
+global parameters Ip / beta_n) is computed from B with Ampere's law,
+    I(psi) = (1/mu0) * closed_integral( B_pol . dl )
+along the FSA contours, so it does not need the current density either.
+
+Only quantities that evaluate 'j' directly (the 'j' field and its flux
+average) need the current density in the dump (dump_ja=T in nimrod.in).
+Otherwise nimpy aborts the whole process with
 'NIM_STOP => Evaluation of j requires dump_ja=T', which cannot be caught.
 The adapter therefore reads dump_ja from nimrod.in (override with
-config['nimrod_dump_ja']) and skips every quantity that needs 'j'
-(j, Ip, and the Ip-based global parameters) when it is not available.
+config['nimrod_dump_ja']) and skips those quantities when it is not set.
 """
 
 import os
@@ -357,9 +363,11 @@ class NIMRODAdapter(SimulationAdapter):
             value = False
         if not value:
             printnote(f"NIMROD: {run_dir.name}/nimrod.in has dump_ja=F. The current "
-                      "density 'j' is not in the dumps; quantities that need it "
-                      "(j, Ip, ...) are skipped. Set dump_ja=T in &output_input to "
-                      "write it (or config['nimrod_dump_ja'] to override).")
+                      "density 'j' is not in the dumps; quantities that evaluate it "
+                      "directly (the 'j' field and its flux average) are skipped. "
+                      "Ip is computed from B (Ampere's law) and is not affected. "
+                      "Set dump_ja=T in &output_input to write j "
+                      "(or config['nimrod_dump_ja'] to override).")
 
         self._dump_ja_cache[run_dir] = value
         return value
@@ -1798,7 +1806,9 @@ class NIMRODAdapter(SimulationAdapter):
             'jphi_over_R': jphi_over_r,
         }
 
-    # edges-ml flux average name -> integrand keys that must be computed
+    # edges-ml flux average name -> integrand keys that must be computed.
+    # 'Ip' needs no integrand: it is computed from B along the FSA contours
+    # (Ampere's law, see _enclosed_current).
     _FSA_NAME_TO_KEYS = {
         'p':    ('p',),
         'pe':   ('pe',),
@@ -1813,7 +1823,7 @@ class NIMRODAdapter(SimulationAdapter):
         'j':    ('j_R', 'j_Z', 'j_phi'),
         'f':    ('f',),
         'ffprime': ('f',),
-        'Ip':   ('jphi_over_R',),
+        'Ip':   (),
         'V':    (),
         'q':    (),
         'rho':  (),
@@ -1821,7 +1831,8 @@ class NIMRODAdapter(SimulationAdapter):
         'flux_t': (),
     }
 
-    _GLOBAL_FSA_KEYS = ('p', 'Bp', 'Bp2', 'jphi_over_R', 'f')
+    # Integrands needed by get_global_parameters() (Ip comes from the contours).
+    _GLOBAL_FSA_KEYS = ('p', 'Bp', 'Bp2', 'f')
 
     def _requested_fsa_keys(self, dump_file=None):
         """
@@ -1843,8 +1854,7 @@ class NIMRODAdapter(SimulationAdapter):
         for n in names:
             keys.update(self._FSA_NAME_TO_KEYS.get(n, ()))
 
-        globals_on = bool(cfg.get("nimrod_compute_globals", True))
-        if globals_on:
+        if cfg.get("nimrod_compute_globals", True):
             keys.update(self._GLOBAL_FSA_KEYS)
 
         if dump_file is not None and not self._current_available(dump_file):
@@ -1853,12 +1863,11 @@ class NIMRODAdapter(SimulationAdapter):
                 keys -= self._CURRENT_FSA_KEYS
                 affected = sorted(n for n in names
                                   if set(self._FSA_NAME_TO_KEYS.get(n, ())) & self._CURRENT_FSA_KEYS)
-                if globals_on:
-                    affected.append("global parameters Ip / beta_n")
                 self._warn_field_once(
                     "nocurrent::fsa",
                     "NIMROD: the current density is not in the dumps (dump_ja=F); "
-                    f"flux averages that need it are skipped: {', '.join(affected)}."
+                    f"flux averages that evaluate it are skipped: {', '.join(affected)}. "
+                    "(Ip is computed from B and is not affected.)"
                 )
 
         return tuple(sorted(keys))
@@ -1906,8 +1915,10 @@ class NIMRODAdapter(SimulationAdapter):
         Runs (and caches) a single FSA pass for the given dump, computing every
         integrand key required by the configuration.
 
-        Returns a dict with 'dvar', 'contours', 'axis' and 'values' (key -> array),
-        or None if the FSA could not be performed.
+        Returns a dict with 'dvar', 'contours', 'axis', 'values' (key -> array),
+        'dump_file' and 'eq', or None if the FSA could not be performed.
+        All surface-indexed arrays (dvar, values, contours) are sorted by
+        ascending psi_norm.
         """
         if dump_file is None or not (_NIMPY_FSA_AVAILABLE and _NIMPY_EVAL_AVAILABLE):
             return None
@@ -1971,13 +1982,18 @@ class NIMRODAdapter(SimulationAdapter):
 
         dvar = np.asarray(dvar)
         yvals = np.asarray(yvals)
+        contours = np.asarray(contours)
         if dvar.size == 0:
             self._fsa_failed.add(cache_key)
             return None
 
+        nsurf_out = dvar.shape[1]
         order = np.argsort(dvar[0, :])
         dvar = dvar[:, order]
         yvals = yvals[:, order] if yvals.size else yvals
+        # Keep the contours aligned with dvar (surface index = last axis).
+        if contours.ndim == 3 and contours.shape[-1] == nsurf_out:
+            contours = contours[..., order]
 
         values = {}
         for i, k in enumerate(keys):
@@ -1985,13 +2001,120 @@ class NIMRODAdapter(SimulationAdapter):
                 values[k] = np.asarray(yvals[i, :], dtype=float)
 
         record = {
-            'dvar':     dvar,
-            'values':   values,
-            'contours': np.asarray(contours),
-            'axis':     axis,
+            'dvar':      dvar,
+            'values':    values,
+            'contours':  contours,
+            'axis':      axis,
+            'dump_file': str(dump_file),
+            'eq':        int(eq),
         }
         self._fsa_cache[cache_key] = record
         return record
+
+    def _enclosed_current(self, record):
+        """
+        Toroidal plasma current enclosed by each FSA surface, from Ampere's law
+
+            I(psi) = (1/mu0) * closed_integral( B_pol . dl )
+
+        evaluated along the FSA contours with the same field (eq) as the
+        averages.  Only the magnetic field is needed (no dump_ja).
+
+        Each contour is oriented counter-clockwise in (R, Z), which in NIMROD's
+        right-handed (R, Z, phi) system gives the current along +phi_NIMROD;
+        the result is converted to the edges-ml / M3D-C1 convention with
+        PHI_SIGN_FLIP.  Returns an array [nsurf] (NaN where a surface could not
+        be integrated), sorted like record['dvar'].
+        """
+        if 'Ip_enclosed' in record:
+            return record['Ip_enclosed']
+
+        dvar = record['dvar']
+        nsurf = dvar.shape[1]
+        ip = np.full(nsurf, np.nan)
+        record['Ip_enclosed'] = ip
+
+        contours = np.asarray(record.get('contours'))
+        dump_file = record.get('dump_file')
+        if (dump_file is None or contours.ndim != 3 or contours.shape[0] < 2
+                or contours.shape[-1] != nsurf):
+            self._warn_field_once(
+                "ip::contours",
+                "NIMROD: FSA contours are not available in the expected layout; "
+                "the plasma current Ip cannot be computed."
+            )
+            return ip
+
+        ev = self._get_eval(dump_file)
+        if ev is None:
+            return ip
+
+        segments = []          # (surface index, n_segments, orientation, dR, dZ)
+        mid_R, mid_Z = [], []
+        for i in range(nsurf):
+            r = np.asarray(contours[0, :, i], dtype=float)
+            z = np.asarray(contours[1, :, i], dtype=float)
+            good = np.isfinite(r) & np.isfinite(z)
+            r, z = r[good], z[good]
+            if r.size < 3:
+                continue
+            r1 = np.append(r, r[0])
+            z1 = np.append(z, z[0])
+            area = 0.5 * np.sum(r1[:-1] * z1[1:] - r1[1:] * z1[:-1])
+            if not np.isfinite(area) or area == 0.0:
+                continue
+            orient = 1.0 if area > 0 else -1.0
+            dR = np.diff(r1)
+            dZ = np.diff(z1)
+            mid_R.append(0.5 * (r1[:-1] + r1[1:]))
+            mid_Z.append(0.5 * (z1[:-1] + z1[1:]))
+            segments.append((i, dR.size, orient, dR, dZ))
+
+        if not segments:
+            return ip
+
+        R = np.concatenate(mid_R)
+        Z = np.concatenate(mid_Z)
+        try:
+            b = np.atleast_2d(np.asarray(self._eval_raw(
+                ev, dump_file, 'b', R, Z, np.zeros_like(R),
+                eq=record.get('eq', 1), use_grid=False)))
+        except Exception as exc:
+            printwarn(f"NIMROD: evaluating B on the FSA contours failed "
+                      f"({brief_error(exc)}); Ip is not available.")
+            return ip
+        if b.shape[0] < 2 or b.shape[-1] != R.size:
+            return ip
+
+        start = 0
+        for i, nseg, orient, dR, dZ in segments:
+            br = b[0, start:start + nseg]
+            bz = b[1, start:start + nseg]
+            start += nseg
+            circ = float(np.sum(br * dR + bz * dZ))
+            if np.isfinite(circ):
+                ip[i] = self.PHI_SIGN_FLIP * orient * circ / self.MU0
+
+        record['Ip_enclosed'] = ip
+        return ip
+
+    def _enclosed_current_profile(self, record, resolution, fcoords):
+        """Enclosed current I(psi) interpolated onto the 1D output grid."""
+        grid, _ = self._fsa_grid(record, resolution, fcoords)
+        if grid.size == 0:
+            return np.array([])
+        row = 1 if 'rho' in str(fcoords).lower() else 0
+        x = np.asarray(record['dvar'][row, :], dtype=float)
+        y = self._enclosed_current(record)
+        good = np.isfinite(x) & np.isfinite(y)
+        if np.count_nonzero(good) < 2:
+            return np.array([])
+        x, y = x[good], y[good]
+        # No current is enclosed at the magnetic axis.
+        if x[0] > 0.0:
+            x = np.insert(x, 0, 0.0)
+            y = np.insert(y, 0, 0.0)
+        return np.interp(grid, x, y)
 
     def _fsa_grid(self, record, resolution, fcoords='pest'):
         """Returns the 1D radial coordinate grid used for all NIMROD 1D output."""
@@ -2074,12 +2197,12 @@ class NIMRODAdapter(SimulationAdapter):
             vol = 2.0 * np.pi * _trapz_profile(dvar[6, :], dvar[2, :])
             return grid, interp(vol)
 
+        # Enclosed plasma current from Ampere's law (B only).
         if name == 'Ip' or low == 'ip':
-            if 'jphi_over_R' not in vals:
+            prof = self._enclosed_current_profile(record, resolution, fcoords)
+            if prof.size == 0:
                 return grid, np.array([])
-            raw = np.asarray(vals['jphi_over_R']) * np.asarray(dvar[6, :])
-            cur = self.PHI_SIGN_FLIP * _trapz_profile(raw, dvar[2, :])
-            return grid, interp(cur)
+            return grid, prof
 
         if low == 'f':
             if 'f' not in vals:
@@ -2204,8 +2327,8 @@ class NIMRODAdapter(SimulationAdapter):
             out['R_axis'] = _finite(axis[0])
             out['Z_axis'] = _finite(axis[1])
 
-            # --- LCFS shaping ------------------------------------------
-            if contours.size:
+            # --- LCFS shaping (outermost surface; contours sorted by psi_N) --
+            if contours.size and contours.ndim == 3:
                 lcfs = np.asarray(contours[:, :, -1], dtype=float)
                 r_l = lcfs[0, :]
                 z_l = lcfs[1, :]
@@ -2251,12 +2374,10 @@ class NIMRODAdapter(SimulationAdapter):
             volume = float(vol_prof[-1]) if vol_prof.size else np.nan
             out['volume'] = _finite(volume)
 
-            # --- plasma current (needs dump_ja=T) -------------------------
-            ip = np.nan
-            if 'jphi_over_R' in vals:
-                raw = np.asarray(vals['jphi_over_R']) * vprime
-                ip_prof = self.PHI_SIGN_FLIP * _trapz_profile(raw, psi)
-                ip = float(ip_prof[-1]) if ip_prof.size else np.nan
+            # --- plasma current (Ampere's law on the outermost surface) ---
+            ip_prof = self._enclosed_current(record)
+            ip_fin = ip_prof[np.isfinite(ip_prof)]
+            ip = float(ip_fin[-1]) if ip_fin.size else np.nan
             out['Ip'] = _finite(ip)
 
             # --- on-axis values -------------------------------------------
