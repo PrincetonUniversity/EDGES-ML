@@ -45,16 +45,31 @@ along the FSA contours, so it does not need the current density either.
 
 Only quantities that evaluate 'j' directly (the 'j' field and its flux
 average) need the current density in the dump (dump_ja=T in nimrod.in).
-Otherwise nimpy aborts the whole process with
-'NIM_STOP => Evaluation of j requires dump_ja=T', which cannot be caught.
-The adapter therefore reads dump_ja from nimrod.in (override with
+The adapter reads dump_ja from nimrod.in (override with
 config['nimrod_dump_ja']) and skips those quantities when it is not set.
+
+Crash-safe probing
+------------------
+nimpy's Fortran library terminates the whole Python process when a field
+cannot be evaluated (NIM_STOP or a segmentation fault); neither can be caught.
+Therefore every EvalNimrod initialisation and every nimpy field is first tried
+once in a forked child process (config['nimrod_safe_probe'], default True).
+Field lists / fields whose probe crashes or fails are not used, and the
+quantities that need them are skipped with a warning.  The probe results are
+cached, so each field is probed only once per dump.
+
+Set config['nimrod_verbose'] = True to print a marker before every nimpy
+stage (useful to locate a remaining crash).
 """
 
 import os
 import re
 import sys
+import time
 import shutil
+import pickle
+import select
+import signal
 import hashlib
 import contextlib
 import subprocess
@@ -153,6 +168,107 @@ def _points_signature(*arrays):
     return h.hexdigest()
 
 
+def _run_isolated(func, timeout=600.0, quiet=True):
+    """
+    Runs func() in a forked child process, so that a crash inside nimpy's
+    Fortran library (segmentation fault, NIM_STOP / Fortran STOP) cannot take
+    down the main process.
+
+    Returns (ok, result_or_message):
+        (True,  result)   func() returned normally (result must be picklable)
+        (False, message)  func() raised, or the child crashed / exited
+        (None,  message)  the child did not finish within *timeout* seconds
+    Without os.fork (non-POSIX systems) func() is run directly.
+    """
+    if not hasattr(os, "fork"):
+        try:
+            return True, func()
+        except Exception as exc:
+            return False, brief_error(exc)
+
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:                                   # ---- child ----
+        try:
+            os.close(r)
+            if quiet:
+                try:
+                    devnull = os.open(os.devnull, os.O_WRONLY)
+                    os.dup2(devnull, 1)
+                    os.dup2(devnull, 2)
+                except Exception:
+                    pass
+            try:
+                payload = pickle.dumps((True, func()))
+            except BaseException as exc:
+                payload = pickle.dumps((False, f"{type(exc).__name__}: {exc}"))
+            with os.fdopen(w, "wb") as fh:
+                fh.write(payload)
+        finally:
+            os._exit(0)
+
+    # ---- parent ----
+    os.close(w)
+    chunks = []
+    deadline = time.monotonic() + float(timeout)
+    timed_out = False
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                break
+            ready, _, _ = select.select([r], [], [], remaining)
+            if not ready:
+                continue
+            data = os.read(r, 65536)
+            if not data:
+                break
+            chunks.append(data)
+    finally:
+        os.close(r)
+
+    if timed_out:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
+        try:
+            os.waitpid(pid, 0)
+        except Exception:
+            pass
+        return None, f"timeout after {timeout:.0f} s"
+
+    try:
+        _, status = os.waitpid(pid, 0)
+    except Exception as exc:
+        return False, f"waitpid failed: {exc}"
+
+    if os.WIFSIGNALED(status):
+        sig = os.WTERMSIG(status)
+        try:
+            name = signal.Signals(sig).name
+        except Exception:
+            name = f"signal {sig}"
+        return False, f"crashed ({name})"
+
+    if chunks:
+        try:
+            ok, res = pickle.loads(b"".join(chunks))
+            return bool(ok), res
+        except Exception:
+            pass
+
+    code = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+    return False, f"terminated (exit code {code}, e.g. NIM_STOP)"
+
+
 # ===========================================================================
 # ADAPTER
 # ===========================================================================
@@ -192,9 +308,13 @@ class NIMRODAdapter(SimulationAdapter):
         'pi': ('p', 'pe'),   # ion pressure = total - electron
     }
 
-    # Ordered list of nimpy 'fieldlist' strings to attempt when initialising
-    # EvalNimrod.  The first one that initialises successfully is kept.
-    # 'j' is removed from these candidates if the run has dump_ja=F.
+    # Base nimpy 'fieldlist' (same as the standard nimpy FSA scripts) and the
+    # fallbacks tried if it cannot be initialised.  'j' is added only for runs
+    # with dump_ja=T, 'e' only if the electric field is requested.
+    _BASE_FIELDLIST = 'nvptb'
+    _FALLBACK_FIELDLISTS = ('nvpt', 'nvp', 'n')
+
+    # Kept for backwards compatibility (no longer used directly).
     _FIELDLIST_CANDIDATES = ('nvptbje', 'nvptbj', 'nvptb', 'nvpt', 'nvp', 'n')
 
     # nimpy fields that need the current density in the dump (dump_ja=T).
@@ -202,6 +322,17 @@ class NIMRODAdapter(SimulationAdapter):
 
     # FSA integrand keys that evaluate the current density.
     _CURRENT_FSA_KEYS = frozenset({'j', 'j_R', 'j_Z', 'j_phi', 'jphi_over_R'})
+
+    # FSA integrand key -> nimpy fields evaluated by it (used for probing).
+    _FSA_KEY_FIELDS = {
+        'p': ('p',), 'pe': ('pe',), 'te': ('te',), 'ti': ('ti',),
+        'psi': ('psi',), 'ne': ('n',), 'ni': ('n',),
+        'B': ('b',), 'B_R': ('b',), 'B_Z': ('b',), 'B_phi': ('b',),
+        'Bp': ('b',), 'Bp2': ('b',), 'f': ('b',),
+        'v': ('v',), 'v_R': ('v',), 'v_Z': ('v',), 'v_phi': ('v',),
+        'j': ('j',), 'j_R': ('j',), 'j_Z': ('j',), 'j_phi': ('j',),
+        'jphi_over_R': ('j',),
+    }
 
     # Flux-average names that require no FSA integrand (taken from dvar).
     _FSA_FROM_DVAR = {
@@ -259,6 +390,12 @@ class NIMRODAdapter(SimulationAdapter):
         # dump_ja (current density in the dump) per run directory
         self._dump_ja_cache = {}
 
+        # Crash-safe probing of nimpy (see _run_isolated)
+        self._init_probe_cache = {}
+        self._field_probe_cache = {}
+        self._probe_point_cache = {}
+        self._probe_disabled = False
+
         # Per-mode evaluation / spectrum caches
         self._geometry_cache = {}
         self._mode_table_cache = {}
@@ -298,6 +435,184 @@ class NIMRODAdapter(SimulationAdapter):
         self._mode_table_cache.clear()
         self._fluxcoord_cache.clear()
         self._fluxcoord_failed.clear()
+        self._field_probe_cache.clear()
+        self._init_probe_cache.clear()
+        self._probe_point_cache.clear()
+
+    def _stage(self, message):
+        """Prints a stage marker if config['nimrod_verbose'] is set."""
+        if (self._config or {}).get("nimrod_verbose", False):
+            printnote(f"NIMROD [stage] {message}")
+
+    # ======================================================================
+    # CRASH-SAFE PROBING OF NIMPY
+    # ======================================================================
+
+    def _probing_enabled(self):
+        return (bool((self._config or {}).get("nimrod_safe_probe", True))
+                and not self._probe_disabled and hasattr(os, "fork"))
+
+    def _probe_timeout(self):
+        try:
+            return float((self._config or {}).get("nimrod_probe_timeout", 600.0))
+        except Exception:
+            return 600.0
+
+    def _disable_probing(self, message):
+        if not self._probe_disabled:
+            printwarn(f"NIMROD: the crash-safe subprocess probe did not finish ({message}); "
+                      "probing is disabled for the rest of this run.")
+        self._probe_disabled = True
+
+    def _probe_eval_init(self, dump_path, fieldlist):
+        """
+        Tries EvalNimrod(dump, fieldlist) once in a child process.
+        Returns (ok, message); ok=True if the initialisation is safe.
+        """
+        if not self._probing_enabled():
+            return True, ""
+        key = (str(dump_path), fieldlist)
+        if key in self._init_probe_cache:
+            return self._init_probe_cache[key]
+
+        self._stage(f"probing EvalNimrod({dump_path.name}, fieldlist='{fieldlist}')")
+
+        def job():
+            with _pushd(dump_path.parent):
+                EvalNimrod(str(dump_path), fieldlist=fieldlist, path='./')
+            return True
+
+        ok, msg = _run_isolated(job, self._probe_timeout())
+        if ok is None:
+            self._disable_probing(msg)
+            result = (True, "")
+        elif ok:
+            result = (True, "")
+        else:
+            printwarn(f"NIMROD: EvalNimrod with fieldlist '{fieldlist}' fails for "
+                      f"{dump_path.parent.name}/{dump_path.name} ({msg}); trying the next "
+                      "field list.")
+            result = (False, str(msg))
+        self._init_probe_cache[key] = result
+        return result
+
+    def _native_points_for_file(self, dump_file):
+        """(R, Z) coordinates of the native finite element nodes of *dump_file*."""
+        key = str(dump_file)
+        if key in self._native_points_cache:
+            return self._native_points_cache[key]
+
+        chunks = []
+        try:
+            with h5py.File(dump_file, 'r') as h5:
+                rblocks = h5.get('rblocks')
+                if rblocks:
+                    for block_name in rblocks.keys():
+                        rz_name = f"rz{block_name}"
+                        if rz_name in rblocks[block_name]:
+                            rzdat = np.asarray(rblocks[block_name][rz_name][()])
+                            chunks.append(rzdat.reshape(-1, rzdat.shape[-1])[:, :2])
+        except Exception as exc:
+            printwarn(f"Failed to read native mesh from {dump_file}: {exc}")
+
+        if chunks:
+            pts = np.concatenate(chunks, axis=0)
+            pts = np.unique(np.round(pts, 12), axis=0)
+        else:
+            pts = np.empty((0, 2))
+
+        self._native_points_cache[key] = pts
+        return pts
+
+    def _probe_point(self, dump_file):
+        """A point inside the domain of *dump_file* (mesh node nearest the centre)."""
+        key = str(Path(dump_file).resolve())
+        if key in self._probe_point_cache:
+            return self._probe_point_cache[key]
+
+        point = None
+        pts = self._native_points_for_file(dump_file)
+        if len(pts) > 0:
+            rc = 0.5 * (pts[:, 0].min() + pts[:, 0].max())
+            zc = 0.5 * (pts[:, 1].min() + pts[:, 1].max())
+            i = int(np.argmin((pts[:, 0] - rc) ** 2 + (pts[:, 1] - zc) ** 2))
+            point = np.array([pts[i, 0], pts[i, 1], 0.0], dtype=float)
+
+        self._probe_point_cache[key] = point
+        return point
+
+    def _field_ok(self, dump_file, nim_field, eq=1):
+        """
+        True if the nimpy field *nim_field* can be evaluated for *dump_file*
+        without crashing the process.  The first evaluation is done once in a
+        forked child process; the result is cached.
+        """
+        if dump_file is None:
+            return False
+        if nim_field in self._CURRENT_FIELDS and not self._current_available(dump_file):
+            return False
+        if not self._probing_enabled():
+            return True
+
+        ev = self._get_eval(dump_file)
+        if ev is None:
+            return False
+
+        dump_path = Path(dump_file).resolve()
+        key = (str(dump_path), self._fieldlist, str(nim_field), int(eq))
+        if key in self._field_probe_cache:
+            return self._field_probe_cache[key]
+
+        point = self._probe_point(dump_file)
+        if point is None:
+            self._field_probe_cache[key] = True
+            return True
+
+        self._stage(f"probing field '{nim_field}' (eq={eq}) on {dump_path.name}")
+
+        def job():
+            with _pushd(dump_path.parent):
+                v = ev.eval_field(nim_field, point, dmode=0, eq=eq)
+            return np.asarray(v, dtype=float).ravel().tolist()
+
+        ok, msg = _run_isolated(job, self._probe_timeout())
+        if ok is None:
+            self._disable_probing(msg)
+            ok = True
+        elif not ok:
+            printwarn(f"NIMROD: evaluating field '{nim_field}' (eq={eq}) fails for "
+                      f"{dump_path.parent.name}/{dump_path.name} ({msg}); quantities "
+                      "that need it are skipped.")
+
+        self._field_probe_cache[key] = bool(ok)
+        return bool(ok)
+
+    def _nim_fields(self, kind, payload):
+        """nimpy field names needed by a resolved edges-ml field."""
+        if kind == 'scalar':
+            return [payload[0]]
+        if kind == 'vector':
+            return [payload]
+        if kind == 'derived':
+            out = []
+            for name in payload:
+                for f in self._nim_fields(*self._resolve_field(name)):
+                    if f not in out:
+                        out.append(f)
+            return out
+        return []
+
+    def _skip_unsafe_field(self, name, kind, payload, dump_file, eq):
+        """Warns once and returns True if a nimpy field needed by *name* fails."""
+        for f in self._nim_fields(kind, payload):
+            if not self._field_ok(dump_file, f, eq):
+                self._warn_field_once(
+                    f"unsafe::{name}",
+                    f"Field '{name}' cannot be evaluated from this NIMROD dump "
+                    f"(nimpy field '{f}' fails); skipping."
+                )
+                return True
+        return False
 
     # ======================================================================
     # CURRENT DENSITY AVAILABILITY (dump_ja)
@@ -793,13 +1108,45 @@ class NIMRODAdapter(SimulationAdapter):
     # EVALNIMROD HANDLING
     # ======================================================================
 
+    def _fieldlist_candidates(self, dump_file):
+        """
+        Ordered nimpy field lists to try for *dump_file*.
+
+        The base list 'nvptb' is the one used by the standard nimpy FSA
+        scripts.  'j' is only added for runs with dump_ja=T, 'e' only if the
+        electric field is requested (or config['nimrod_eval_e'] is set).
+        """
+        cfg = self._config or {}
+        allow_j = self._current_available(dump_file)
+
+        want_e = bool(cfg.get("nimrod_eval_e", False))
+        try:
+            sel = export_selection(cfg)
+            for section in ("equilibrium", "total_fields", "perturbations"):
+                for kind in ("flux_averages", "2d_fields", "3d_fields"):
+                    if any(str(n) in ('E', 'e') for n in sel[section][kind]):
+                        want_e = True
+        except Exception:
+            pass
+
+        base = self._BASE_FIELDLIST
+        with_j = base + ('j' if allow_j else '')
+        first = with_j + ('e' if want_e else '')
+
+        out = []
+        for fl in (first, with_j, base) + self._FALLBACK_FIELDLISTS:
+            if fl and fl not in out:
+                out.append(fl)
+        return out
+
     def _get_eval(self, dump_file, fieldlist=None):
         """
         Returns a cached EvalNimrod instance for the given dump file.
 
         The nimpy shared library can only keep one dump file open at a time, so
-        a single active handle is tracked and re-initialised on demand.  If the
-        run has dump_ja=F, 'j' is removed from the field list.
+        a single active handle is tracked and re-initialised on demand.  Every
+        field list is first tried in a child process (crash-safe probing); if
+        the run has dump_ja=F, 'j' is removed from the field list.
         """
         if not _NIMPY_EVAL_AVAILABLE or dump_file is None:
             return None
@@ -818,14 +1165,19 @@ class NIMRODAdapter(SimulationAdapter):
                 return self._active_eval
 
         candidates = []
-        for fl in ([requested] if requested else []) + list(self._FIELDLIST_CANDIDATES):
+        for fl in ([requested] if requested else []) + self._fieldlist_candidates(dump_file):
             fl = _strip(fl)
             if fl and fl not in candidates:
                 candidates.append(fl)
 
         errors = []
         for fl in candidates:
+            ok, msg = self._probe_eval_init(dump_path, fl)
+            if not ok:
+                errors.append(f"{fl}: {msg}")
+                continue
             try:
+                self._stage(f"EvalNimrod({dump_path.name}, fieldlist='{fl}')")
                 with _pushd(dump_path.parent):
                     ev = EvalNimrod(str(dump_path), fieldlist=fl, path='./')
                 self._active_eval = ev
@@ -992,6 +1344,8 @@ class NIMRODAdapter(SimulationAdapter):
 
         if self._skip_current_field(name, kind, payload, dump_file):
             return np.array([])
+        if self._skip_unsafe_field(name, kind, payload, dump_file, eq):
+            return np.array([])
 
         ev = self._get_eval(dump_file)
         if ev is None:
@@ -1138,6 +1492,8 @@ class NIMRODAdapter(SimulationAdapter):
             return {}
 
         if self._skip_current_field(name, kind, payload, dump_file):
+            return {}
+        if self._skip_unsafe_field(name, kind, payload, dump_file, 2):
             return {}
 
         ev = self._get_eval(dump_file)
@@ -1345,11 +1701,14 @@ class NIMRODAdapter(SimulationAdapter):
             return None
 
         ev = self._get_eval(dump_file)
-        if ev is None:
+        if ev is None or not self._field_ok(dump_file, 'b', 1):
+            printerr(f"NIMROD: the magnetic field cannot be evaluated for "
+                     f"{Path(dump_file).name}; no flux coordinates / spectra.")
             self._fluxcoord_failed.add(key)
             return None
 
         try:
+            self._stage(f"flux coordinates ({fcoords}, {points} points) on {Path(dump_file).name}")
             axis = self._find_magnetic_axis(ev, dump_file)
             bbox = self._get_bounding_box(-1)
             torgeom, per_length = self._geometry(dump_file)
@@ -1457,6 +1816,8 @@ class NIMRODAdapter(SimulationAdapter):
             return {}
         if self._skip_current_field(field, kind, payload, dump_file):
             return {}
+        if self._skip_unsafe_field(field, kind, payload, dump_file, 2):
+            return {}
 
         fc = self._get_flux_coordinates(dump_file, settings)
         if fc is None:
@@ -1539,31 +1900,7 @@ class NIMRODAdapter(SimulationAdapter):
         dump_file = self._get_dump_file(time)
         if not dump_file:
             return np.empty((0, 2))
-
-        if dump_file in self._native_points_cache:
-            return self._native_points_cache[dump_file]
-
-        chunks = []
-        try:
-            with h5py.File(dump_file, 'r') as h5:
-                rblocks = h5.get('rblocks')
-                if rblocks:
-                    for block_name in rblocks.keys():
-                        rz_name = f"rz{block_name}"
-                        if rz_name in rblocks[block_name]:
-                            rzdat = np.asarray(rblocks[block_name][rz_name][()])
-                            chunks.append(rzdat.reshape(-1, rzdat.shape[-1])[:, :2])
-        except Exception as exc:
-            printwarn(f"Failed to read native mesh from {dump_file}: {exc}")
-
-        if chunks:
-            pts = np.concatenate(chunks, axis=0)
-            pts = np.unique(np.round(pts, 12), axis=0)
-        else:
-            pts = np.empty((0, 2))
-
-        self._native_points_cache[dump_file] = pts
-        return pts
+        return self._native_points_for_file(dump_file)
 
     def _get_wall_polygon(self):
         """
@@ -1834,13 +2171,14 @@ class NIMRODAdapter(SimulationAdapter):
     # Integrands needed by get_global_parameters() (Ip comes from the contours).
     _GLOBAL_FSA_KEYS = ('p', 'Bp', 'Bp2', 'f')
 
-    def _requested_fsa_keys(self, dump_file=None):
+    def _requested_fsa_keys(self, dump_file=None, eq=1):
         """
         Integrand keys required by the flux averages of all three sections
         (equilibrium, total_fields, perturbations).
 
-        Keys that evaluate the current density are dropped if *dump_file*
-        belongs to a run with dump_ja=F.
+        If *dump_file* is given, keys that evaluate the current density are
+        dropped for runs with dump_ja=F, and keys whose nimpy fields fail the
+        crash-safe probe are dropped as well.
         """
         cfg = self._config or {}
         sel = export_selection(cfg)
@@ -1870,6 +2208,22 @@ class NIMRODAdapter(SimulationAdapter):
                     "(Ip is computed from B and is not affected.)"
                 )
 
+        if dump_file is not None:
+            bad = []
+            for k in sorted(keys):
+                fields = self._FSA_KEY_FIELDS.get(k, ())
+                if any(not self._field_ok(dump_file, f, eq) for f in fields):
+                    bad.append(k)
+            if bad:
+                keys -= set(bad)
+                affected = sorted(n for n in names
+                                  if set(self._FSA_NAME_TO_KEYS.get(n, ())) & set(bad))
+                self._warn_field_once(
+                    f"unsafe::fsa::{eq}",
+                    f"NIMROD: flux-surface-average integrands {bad} cannot be evaluated "
+                    f"(eq={eq}); the flux averages {affected} are skipped."
+                )
+
         return tuple(sorted(keys))
 
     def _fsa_nsurf(self, resolution):
@@ -1881,6 +2235,8 @@ class NIMRODAdapter(SimulationAdapter):
         key = str(Path(dump_file).resolve())
         if key in self._axis_cache:
             return self._axis_cache[key]
+
+        self._stage(f"magnetic-axis search on {Path(dump_file).name}")
 
         rmin, rmax, zmin, zmax = self._get_bounding_box(time)
         dr = 0.08 * (rmax - rmin)
@@ -1901,6 +2257,7 @@ class NIMRODAdapter(SimulationAdapter):
             printwarn(f"Coarse magnetic-axis search failed: {exc}")
 
         if _NIMPY_FSA_AVAILABLE:
+            self._stage("find_pf_null (magnetic axis refinement)")
             try:
                 with _pushd(Path(dump_file).resolve().parent):
                     axis = np.asarray(find_pf_null(ev, axis, addpert=False))
@@ -1925,7 +2282,16 @@ class NIMRODAdapter(SimulationAdapter):
         if not (self._config or {}).get("nimrod_enable_fsa", True):
             return None
 
-        keys = self._requested_fsa_keys(dump_file)
+        # Field-line tracing needs the magnetic field.
+        if not self._field_ok(dump_file, 'b', eq):
+            self._warn_field_once(
+                f"fsa::nob::{dump_file}::{eq}",
+                f"NIMROD: the magnetic field cannot be evaluated for "
+                f"{Path(dump_file).name} (eq={eq}); flux averages are skipped."
+            )
+            return None
+
+        keys = self._requested_fsa_keys(dump_file, eq)
         cache_key = (str(Path(dump_file).resolve()), int(nsurf), int(eq), keys)
         if cache_key in self._fsa_cache:
             return self._fsa_cache[cache_key]
@@ -1953,6 +2319,7 @@ class NIMRODAdapter(SimulationAdapter):
 
         printnote(f"NIMROD: running flux surface average on {Path(dump_file).name} "
                   f"({nsurf} surfaces, {len(keys)} quantities, eq={eq}).")
+        self._stage(f"FSA integrands: {list(keys)}")
 
         try:
             # FSAInput.d is a class-level global in nimpy; reset it so that a
@@ -1979,6 +2346,8 @@ class NIMRODAdapter(SimulationAdapter):
         finally:
             FSAInput.d['rzo'] = None
             FSAInput.d['rzx'] = None
+
+        self._stage("FSA finished")
 
         dvar = np.asarray(dvar)
         yvals = np.asarray(yvals)
@@ -2076,6 +2445,7 @@ class NIMRODAdapter(SimulationAdapter):
         R = np.concatenate(mid_R)
         Z = np.concatenate(mid_Z)
         try:
+            self._stage("B on FSA contours (Ampere's law)")
             b = np.atleast_2d(np.asarray(self._eval_raw(
                 ev, dump_file, 'b', R, Z, np.zeros_like(R),
                 eq=record.get('eq', 1), use_grid=False)))
@@ -2384,27 +2754,32 @@ class NIMRODAdapter(SimulationAdapter):
             ev = self._get_eval(dump_file)
             if ev is not None:
                 rzo = np.array([axis[0], axis[1], 0.0])
-                with _pushd(Path(dump_file).resolve().parent):
-                    def _axis_scalar(field, idx=0):
-                        try:
-                            v = ev.eval_field(field, rzo, dmode=0, eq=1)
-                            return float(np.atleast_1d(v)[idx])
-                        except Exception:
-                            return np.nan
 
-                    b0 = np.nan
+                def _axis_scalar(field, idx=0):
+                    if not self._field_ok(dump_file, field, 1):
+                        return np.nan
                     try:
-                        bvec = ev.eval_field('b', rzo, dmode=0, eq=1)
+                        with _pushd(Path(dump_file).resolve().parent):
+                            v = ev.eval_field(field, rzo, dmode=0, eq=1)
+                        return float(np.atleast_1d(v)[idx])
+                    except Exception:
+                        return np.nan
+
+                b0 = np.nan
+                if self._field_ok(dump_file, 'b', 1):
+                    try:
+                        with _pushd(Path(dump_file).resolve().parent):
+                            bvec = ev.eval_field('b', rzo, dmode=0, eq=1)
                         b0 = float(bvec[2])
                     except Exception:
                         pass
 
-                    out['B0'] = _finite(self.PHI_SIGN_FLIP * b0)
-                    out['p0'] = _finite(_axis_scalar('p'))
-                    out['ne0'] = _finite(_axis_scalar('n', 0))
-                    out['ni0'] = _finite(_axis_scalar('n', self._ion_index(ev)))
-                    out['Te0'] = _finite(_axis_scalar('te'))
-                    out['Ti0'] = _finite(_axis_scalar('ti'))
+                out['B0'] = _finite(self.PHI_SIGN_FLIP * b0)
+                out['p0'] = _finite(_axis_scalar('p'))
+                out['ne0'] = _finite(_axis_scalar('n', 0))
+                out['ni0'] = _finite(_axis_scalar('n', self._ion_index(ev)))
+                out['Te0'] = _finite(_axis_scalar('te'))
+                out['Ti0'] = _finite(_axis_scalar('ti'))
 
             b0_abs = abs(_finite(out.get('B0', np.nan), 0.0))
 
