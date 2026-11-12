@@ -36,6 +36,15 @@ DEFAULT_GRID_2D = GridSpec("rectangular", (128, 128))
 DEFAULT_GRID_3D = GridSpec("rectangular", (64, 16, 64))
 
 
+def _has_data(value):
+    """True if a flux-average / field result contains any data."""
+    if value is None:
+        return False
+    if isinstance(value, dict):
+        return any(np.size(v) > 0 for v in value.values())
+    return np.size(value) > 0
+
+
 class SimulationAdapter:
 
     CODE_NAME = "UNKNOWN"
@@ -291,6 +300,49 @@ class SimulationAdapter:
 
         return data
 
+    @staticmethod
+    def _stack_flux_averages(field, results, time_slices):
+        """
+        Stacks per-time-slice flux averages into [N_t, N_psi] arrays.
+
+        Time slices for which the quantity is not available are filled with
+        NaN.  Returns {} (with a warning) if the quantity is unavailable for
+        every time slice, so that no fake all-zero data is written.
+        """
+        valid = [r for r in results if _has_data(r)]
+        if not valid:
+            printwarn(f"Total-field flux average '{field}' is not available for any "
+                      f"of the time slices {list(time_slices)}; skipping.")
+            return {}
+
+        missing = [ts for ts, r in zip(time_slices, results) if not _has_data(r)]
+        if missing:
+            printwarn(f"Total-field flux average '{field}' is not available for time "
+                      f"slice(s) {missing}; these are filled with NaN.")
+
+        ref = valid[0]
+        out = {}
+        if isinstance(ref, dict):
+            for comp, ref_arr in ref.items():
+                ref_arr = np.asarray(ref_arr, dtype=float)
+                rows = []
+                for r in results:
+                    if isinstance(r, dict) and comp in r and np.size(r[comp]) == ref_arr.size:
+                        rows.append(np.asarray(r[comp], dtype=float))
+                    else:
+                        rows.append(np.full_like(ref_arr, np.nan))
+                out[comp] = np.stack(rows, axis=0)
+        else:
+            ref_arr = np.asarray(ref, dtype=float)
+            rows = []
+            for r in results:
+                if not isinstance(r, dict) and np.size(r) == ref_arr.size:
+                    rows.append(np.asarray(r, dtype=float))
+                else:
+                    rows.append(np.full_like(ref_arr, np.nan))
+            out[field] = np.stack(rows, axis=0)
+        return out
+
     def extract_total_fields(self, config):
         """
         Extracts the quantities listed under config['total_fields'] for every
@@ -315,14 +367,8 @@ class SimulationAdapter:
             results = []
             for ts in time_slices:
                 _, f_vals = self.get_flux_average(field, res_1d, units, fcoords, time=ts, use_eq_fs=True)
-                if not isinstance(f_vals, dict) and len(f_vals) == 0:
-                    f_vals = np.zeros(res_1d)
                 results.append(f_vals)
-            if results and isinstance(results[0], dict):
-                for comp in results[0].keys():
-                    data["flux_averages"][comp] = np.stack([r[comp] for r in results], axis=0)
-            else:
-                data["flux_averages"][field] = np.stack(results, axis=0) if results else np.array([])
+            data["flux_averages"].update(self._stack_flux_averages(field, results, time_slices))
 
         grid_2d = self._grid_spec(config, 2)
         for field in sel["2d_fields"]:
