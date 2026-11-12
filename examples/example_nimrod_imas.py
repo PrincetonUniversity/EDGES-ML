@@ -49,7 +49,7 @@ config = {
     "2d_grid": edges_ml.GridSpec("inside_wall", None),
     "3d_grid": edges_ml.GridSpec("rectangular", (64, 2, 64)),
 
-    "include_input_namelist": True,
+    "include_input_namelist": False,
     "output_format": "imas_h5",        # 'reduced_h5', 'reduced_bp', 'imas_h5'
 }
 
@@ -57,9 +57,7 @@ config = {
 data_sources = [
     {
         "code": "nimrod",
-        "directories": [
-            "nimrod_runs/nstx_132543/v04",
-        ],
+        "directories": ["nimrod_runs/mastu_45272/run001"],
         "model": None
     }
 ]
@@ -67,6 +65,6 @@ data_sources = [
 if __name__ == "__main__":
     edges_ml.build_dataset(
         sources=data_sources,
-        output_directory="./datasets",
+        output_directory="./datasets_imas_nimrod",
         config=config
     )

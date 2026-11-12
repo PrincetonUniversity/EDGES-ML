@@ -11,6 +11,10 @@ physical perturbation of that mode, 2 Re[c_n exp(i n phi)], evaluated per mode
 listed under 'perturbations' on flux-aligned coordinates of the equilibrium
 (port of M3D-C1's flux_coordinates()); vector fields such as 'B' are written
 as fields but get no spectrum.
+
+The output can be inspected with examples/plot_perturbation.py, e.g.
+    python examples/plot_perturbation.py datasets_nimrod/<file>.h5 --list
+    python examples/plot_perturbation.py datasets_nimrod/<file>.h5 --field p --fluxgrid
 """
 
 import edges_ml
@@ -19,35 +23,35 @@ config = {
     "units": "mks",          # 'mks', 'cgs' or 'codeunits'
     "fcoords": "pest",       # 'pest', 'boozer', 'hamada', 'canonical', 'geometric'
 
-    # Time slices for which the total fields are exported (e.g. [0, 1, 20])
+    # Time slices for which the total fields are exported (e.g. [0, 10, 20])
     "time_slices": [2],
 
     "resolutions": {
-        "1d": 200
+        "1d": 600
     },
 
     # Time traces (1D scalars) to export
-    "time_traces": ["Ave_P", "E_K3"],
+    "time_traces": [],
 
     # Equilibrium quantities
     "equilibrium": {
         "flux_averages": "all",
-        "2d_fields": ["B", "ne", "te"],
+        "2d_fields": ["B", "p"],
         "3d_fields": [],
     },
 
     # Total fields, evaluated at every entry of 'time_slices'
     "total_fields": {
-        "flux_averages": ["p", "q"],
-        "2d_fields": ["B", "ne", "te"],
-        "3d_fields": [],
+        "flux_averages": ["p", "q", "j"],
+        "2d_fields": ["B", "p"],
+        "3d_fields": ["p"],
     },
 
-    # Perturbations (mode structure).  Spectra are computed for 'p'
-    # ('B' is a vector field: written as 2D field, no spectrum).
+    # Perturbations (mode structure).  The poloidal spectrum is computed for
+    # every scalar quantity listed here (here: 'p').
     "perturbations": {
         "flux_averages": [],
-        "2d_fields": ["B", "p"],
+        "2d_fields": ["p"],
         "3d_fields": [],
         "spectrum": {                  # numerical settings only, no quantity list
             "fcoords": "pest",         # 'pest' (default), 'boozer', 'hamada'; '' = geometric
@@ -71,9 +75,9 @@ config = {
     # Grid specifications (shared by ALL 2D / 3D fields of every section)
     "shared_grid_source": "first",     # 'first', '/path/to/simulation' or None
     "2d_grid": edges_ml.GridSpec("inside_wall", None),
-    "3d_grid": edges_ml.GridSpec("rectangular", (128, 16, 128)),
+    "3d_grid": edges_ml.GridSpec("rectangular", (64, 2, 64)),
 
-    "include_input_namelist": True,
+    "include_input_namelist": False,
     "output_format": "reduced_h5",     # 'reduced_h5', 'reduced_bp', 'imas_h5'
 }
 
@@ -81,10 +85,7 @@ config = {
 data_sources = [
     {
         "code": "nimrod",
-        "directories": [
-            "nimrod_runs/mastu_45272/run001",
-            "nimrod_runs/mastu_45272/run002",
-        ],
+        "directories": ["nimrod_runs/mastu_45272/run001", "nimrod_runs/mastu_45272/run002"],
         "model": None
     }
 ]
@@ -92,6 +93,6 @@ data_sources = [
 if __name__ == "__main__":
     edges_ml.build_dataset(
         sources=data_sources,
-        output_directory="./datasets",
+        output_directory="./datasets_nimrod",
         config=config
     )
