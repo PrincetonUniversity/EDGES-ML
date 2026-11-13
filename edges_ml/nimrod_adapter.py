@@ -22,6 +22,18 @@ Each toroidal mode in the dump becomes its own 'perturbations/nXX' entry
 EvalNimrod.eval_comp_field(), so single-n and multi-n runs are treated
 identically and no subtraction of two full fields is needed.
 
+Fourier slots of eval_comp_field
+--------------------------------
+eval_comp_field() returns 'nmodes_peq' Fourier slots ("modes plus
+equilibrium"), i.e. normally len(keff) + 1: one slot holds the axisymmetric
+EQUILIBRIUM, the others the perturbation modes in keff order.  The adapter
+detects the equilibrium slot once per dump by comparing every slot with
+eval_field(eq=1) on a few interior mesh nodes, and maps the remaining slots to
+keff (see _mode_table).  The mapping is verified by reconstructing the
+perturbation at phi = 0 from the mode slots and comparing it with
+eval_field(eq=0).  config['nimrod_comp_eq_slot'] forces the equilibrium slot
+(-1: no equilibrium slot).
+
 For every quantity listed under config['perturbations'] the adapter writes
     * flux averages:  <field>(last dump, eq + n=0 perturbation) - <field>(equilibrium).
                       The flux-surface average of an n>0 component vanishes,
@@ -343,6 +355,10 @@ class NIMRODAdapter(SimulationAdapter):
         'q':        7,
     }
 
+    # Fields used to identify the equilibrium slot of eval_comp_field
+    # (tried in this order; the first one that can be evaluated is used).
+    _COMP_LAYOUT_FIELDS = ('n', 'p', 'b')
+
     # NIMROD binary-file traces mapped onto the shared edges-ml registry.
     #   key -> (file kind, variable name in nimpy's readBin registry)
     _TIME_TRACE_MAP = {
@@ -540,6 +556,22 @@ class NIMRODAdapter(SimulationAdapter):
 
         self._probe_point_cache[key] = point
         return point
+
+    def _interior_points(self, dump_file, npts):
+        """A reproducible set of interior mesh nodes of *dump_file* ([N, 2])."""
+        pts = self._native_points_for_file(dump_file)
+        if len(pts) == 0:
+            return None
+        rmin, rmax = pts[:, 0].min(), pts[:, 0].max()
+        zmin, zmax = pts[:, 1].min(), pts[:, 1].max()
+        rc, zc = 0.5 * (rmin + rmax), 0.5 * (zmin + zmax)
+        hr, hz = 0.3 * (rmax - rmin), 0.3 * (zmax - zmin)
+        mask = (np.abs(pts[:, 0] - rc) <= hr) & (np.abs(pts[:, 1] - zc) <= hz)
+        inner = pts[mask] if np.count_nonzero(mask) >= npts else pts
+        rng = np.random.default_rng(12345)
+        n = min(int(npts), len(inner))
+        idx = np.sort(rng.choice(len(inner), size=n, replace=False))
+        return inner[idx]
 
     def _field_ok(self, dump_file, nim_field, eq=1):
         """
@@ -1246,13 +1278,28 @@ class NIMRODAdapter(SimulationAdapter):
                     pass
             return ev.eval_field(nim_field, rzp, dmode=0, eq=eq)
 
+    def _eval_comp_direct(self, ev, dump_file, nim_field, R, Z):
+        """
+        eval_comp_field on a point set without EvalGrid (used for the slot
+        layout detection).  Returns a complex128 array (nqty, nslots, N).
+        """
+        R = np.asarray(R, dtype=float).ravel()
+        Z = np.asarray(Z, dtype=float).ravel()
+        rzp = np.array([R, Z, np.zeros_like(R)])
+        with _pushd(Path(dump_file).resolve().parent):
+            res = np.asarray(ev.eval_comp_field(nim_field, rzp, dmode=0))
+        res = res[:, :, 0, ...].reshape(res.shape[0], res.shape[1], -1)
+        return res.astype(np.complex128)
+
     def _eval_comp_raw(self, ev, dump_file, nim_field, R, Z):
         """
         Per-toroidal-mode evaluation with EvalNimrod.eval_comp_field.
 
-        Returns a complex array of shape (nqty, nmodes, N).  Results are cached
-        per (dump, field, point set), so all toroidal modes (and repeated
-        requests) reuse a single evaluation pass.
+        Returns a complex array of shape (nqty, nslots, N); the slot axis
+        includes the equilibrium slot (see _mode_table for the mapping of
+        slots to toroidal modes).  Results are cached per (dump, field, point
+        set), so all toroidal modes (and repeated requests) reuse a single
+        evaluation pass.
         """
         R = np.asarray(R, dtype=float).ravel()
         Z = np.asarray(Z, dtype=float).ravel()
@@ -1275,7 +1322,7 @@ class NIMRODAdapter(SimulationAdapter):
                 res = ev.eval_comp_field(nim_field, rzp, dmode=0)
 
         res = np.asarray(res)
-        # (nqty, nmodes, nderiv, N) -> (nqty, nmodes, N)
+        # (nqty, nslots, nderiv, N) -> (nqty, nslots, N)
         res = res[:, :, 0, ...].reshape(res.shape[0], res.shape[1], -1)
         self._comp_cache[key] = res
         return res
@@ -1426,13 +1473,111 @@ class NIMRODAdapter(SimulationAdapter):
         self._geometry_cache[d] = result
         return result
 
+    def _detect_comp_eq_slot(self, ev, dump_file, n_vals, nslots):
+        """
+        Identifies the Fourier slot of eval_comp_field that holds the
+        axisymmetric equilibrium, by comparing every slot with
+        eval_field(eq=1) on a few interior mesh nodes.
+
+        Returns (eq_slot, field, c, R, Z):
+            eq_slot  slot index, -1 if no slot matches the equilibrium, or
+                     None if the test could not be performed;
+            field    nimpy field used for the test (or None);
+            c        comp coefficients at the probe points (nqty, nslots, P);
+            R, Z     probe points.
+        """
+        cfg = self._config or {}
+        pts = self._interior_points(dump_file, int(cfg.get("nimrod_comp_probe_points", 16)))
+        if pts is None or len(pts) < 3:
+            return None, None, None, None, None
+        R, Z = pts[:, 0], pts[:, 1]
+
+        for field in self._COMP_LAYOUT_FIELDS:
+            if not (self._field_ok(dump_file, field, 1) and self._field_ok(dump_file, field, 2)):
+                continue
+            try:
+                self._stage(f"comp slot layout test with '{field}' on {Path(dump_file).name}")
+                c = self._eval_comp_direct(ev, dump_file, field, R, Z)
+                E = np.atleast_2d(np.asarray(
+                    self._eval_raw(ev, dump_file, field, R, Z, np.zeros_like(R),
+                                   eq=1, use_grid=False), dtype=float))
+            except Exception as exc:
+                self._stage(f"comp slot layout test with '{field}' failed: {brief_error(exc)}")
+                continue
+
+            if c.shape[1] != nslots or c.shape[-1] != R.size or E.shape[-1] != R.size:
+                continue
+            nq = min(c.shape[0], E.shape[0])
+            good = (np.all(np.isfinite(E[:nq]), axis=0)
+                    & np.all(np.isfinite(c[:nq]), axis=(0, 1)))
+            if np.count_nonzero(good) < 3:
+                continue
+            Eg = E[:nq][:, good]
+            enorm = float(np.linalg.norm(Eg))
+            if enorm == 0.0:
+                continue
+
+            misfit = [float(np.linalg.norm(c[:nq, k][:, good] - Eg)) / enorm
+                      for k in range(nslots)]
+            k = int(np.argmin(misfit))
+            self._stage(f"comp slot misfits vs. equilibrium ('{field}'): "
+                        + ", ".join(f"{m:.2e}" for m in misfit))
+            eq_slot = k if misfit[k] < 1.0e-3 else -1
+            return eq_slot, field, c, R, Z
+
+        return None, None, None, None, None
+
+    def _verify_mode_slots(self, ev, dump_file, field, c, R, Z, table):
+        """
+        Checks that the mode slots reproduce the perturbation-only field
+        eval_field(eq=0) at phi = 0:
+            P(phi=0) = sum_{n=0} Re c_0 + sum_{n>0} 2 Re c_n.
+        Only reports the result (note / warning).
+        """
+        if field is None or c is None or not table:
+            return
+        if not self._field_ok(dump_file, field, 0):
+            return
+        try:
+            P = np.atleast_2d(np.asarray(
+                self._eval_raw(ev, dump_file, field, R, Z, np.zeros_like(R),
+                               eq=0, use_grid=False), dtype=float))
+        except Exception:
+            return
+        nq = min(P.shape[0], c.shape[0])
+        rec = np.zeros((nq, R.size))
+        for slot, n in table:
+            if n == 0:
+                rec += np.real(c[:nq, slot])
+            else:
+                rec += 2.0 * np.real(c[:nq, slot])
+        good = np.all(np.isfinite(P[:nq]), axis=0) & np.all(np.isfinite(rec), axis=0)
+        if np.count_nonzero(good) < 3:
+            return
+        pn = float(np.linalg.norm(P[:nq][:, good]))
+        if pn == 0.0:
+            printnote(f"NIMROD: the perturbation of '{field}' is zero in "
+                      f"{Path(dump_file).name}; the mode slots cannot be verified.")
+            return
+        rel = float(np.linalg.norm(rec[:, good] - P[:nq][:, good])) / pn
+        if rel < 1.0e-2:
+            printnote(f"NIMROD: the comp mode slots of {Path(dump_file).name} reproduce "
+                      f"eval_field(eq=0) of '{field}' at phi=0 (relative misfit {rel:.1e}).")
+        else:
+            printwarn(f"NIMROD: the comp mode slots of {Path(dump_file).name} do NOT "
+                      f"reproduce eval_field(eq=0) of '{field}' at phi=0 (relative misfit "
+                      f"{rel:.2e}); the slot-to-mode mapping may be wrong "
+                      "(see config['nimrod_comp_eq_slot']).")
+
     def _mode_table(self, dump_file):
         """
-        List of (mode_index, n) for the toroidal modes stored in *dump_file*.
+        List of (slot, n) for the toroidal modes stored in *dump_file*.
 
-        The mode index addresses the mode axis returned by eval_comp_field,
-        which is assumed to follow the order of 'keff' in the dump.  For 'lin'
-        geometry keff is converted to a mode index (keff * per_length / 2 pi).
+        'slot' addresses the Fourier axis returned by eval_comp_field.  That
+        axis has nmodes_peq entries; if it is one longer than keff, one slot
+        holds the equilibrium (detected with _detect_comp_eq_slot) and the
+        remaining slots follow the order of 'keff'.  For 'lin' geometry keff is
+        converted to a mode index (keff * per_length / 2 pi).
         """
         if dump_file is None:
             return []
@@ -1454,24 +1599,91 @@ class NIMRODAdapter(SimulationAdapter):
             keff = keff * per_length / (2.0 * np.pi)
 
         n_vals = [int(round(k)) for k in keff]
+        nk = len(n_vals)
 
         ev = self._get_eval(dump_file)
-        nmodes_peq = None
+        nslots = None
         if ev is not None:
             try:
-                nmodes_peq = int(getattr(ev, 'nmodes_peq'))
+                nslots = int(getattr(ev, 'nmodes_peq'))
             except Exception:
-                nmodes_peq = None
-        if nmodes_peq is not None and nmodes_peq != len(n_vals):
-            nuse = min(nmodes_peq, len(n_vals))
+                nslots = None
+        if nslots is None:
+            nslots = nk
+
+        cfg = self._config or {}
+        override = cfg.get("nimrod_comp_eq_slot", None)
+        layout = dict(field=None, c=None, R=None, Z=None)
+
+        eq_slot = None
+        if override is not None:
+            eq_slot = int(override)
+            if eq_slot >= nslots:
+                printwarn(f"NIMROD: config['nimrod_comp_eq_slot']={eq_slot} is out of "
+                          f"range ({nslots} slots); ignored.")
+                eq_slot = None
+            elif eq_slot >= 0:
+                printnote(f"NIMROD: using comp slot {eq_slot} as the equilibrium "
+                          "(config['nimrod_comp_eq_slot']).")
+        if eq_slot is None and ev is not None and nslots == nk + 1:
+            eq_slot, layout['field'], layout['c'], layout['R'], layout['Z'] = \
+                self._detect_comp_eq_slot(ev, dump_file, n_vals, nslots)
+            if eq_slot is None:
+                printwarn(f"NIMROD: eval_comp_field has {nslots} Fourier slots for "
+                          f"keff={n_vals} in {Path(dump_file).name}, but the equilibrium "
+                          "slot could not be identified; assuming slot 0 "
+                          "(override with config['nimrod_comp_eq_slot']).")
+                eq_slot = 0
+            elif eq_slot < 0:
+                printwarn(f"NIMROD: eval_comp_field has {nslots} Fourier slots for "
+                          f"keff={n_vals} in {Path(dump_file).name}, but no slot matches "
+                          "the equilibrium; assuming slot 0 "
+                          "(override with config['nimrod_comp_eq_slot']).")
+                eq_slot = 0
+
+        if eq_slot is not None and 0 <= eq_slot < nslots:
+            slots = [k for k in range(nslots) if k != eq_slot]
+        else:
+            slots = list(range(nslots))
+
+        if len(slots) != nk:
+            nuse = min(len(slots), nk)
             printwarn(
-                f"NIMROD: dump keff has {len(n_vals)} modes but nimpy reports "
-                f"nmodes_peq={nmodes_peq} for {Path(dump_file).name}; using the "
-                f"first {nuse} modes."
+                f"NIMROD: {len(slots)} mode slot(s) in eval_comp_field but keff has "
+                f"{nk} modes for {Path(dump_file).name}; using the first {nuse} modes."
             )
+            slots = slots[:nuse]
             n_vals = n_vals[:nuse]
 
-        table = list(enumerate(n_vals))
+        table = list(zip(slots, n_vals))
+
+        if eq_slot is not None and eq_slot >= 0:
+            printnote(f"NIMROD: eval_comp_field has {nslots} Fourier slots for "
+                      f"keff={n_vals} in {Path(dump_file).name}; slot {eq_slot} is the "
+                      f"equilibrium, mode slots {[s for s, _ in table]}.")
+
+        if ev is not None:
+            if layout['c'] is None and table:
+                # Run the verification also when no detection was needed.
+                pts = self._interior_points(dump_file, int(cfg.get("nimrod_comp_probe_points", 16)))
+                if pts is not None and len(pts) >= 3:
+                    for field in self._COMP_LAYOUT_FIELDS:
+                        if not (self._field_ok(dump_file, field, 0)
+                                and self._field_ok(dump_file, field, 2)):
+                            continue
+                        try:
+                            layout['c'] = self._eval_comp_direct(ev, dump_file, field,
+                                                                 pts[:, 0], pts[:, 1])
+                            layout['field'], layout['R'], layout['Z'] = field, pts[:, 0], pts[:, 1]
+                            break
+                        except Exception:
+                            continue
+            try:
+                self._verify_mode_slots(ev, dump_file, layout['field'], layout['c'],
+                                        layout['R'], layout['Z'], table)
+            except Exception as exc:
+                self._stage(f"comp mode slot verification failed: {brief_error(exc)}")
+
         self._mode_table_cache[key] = table
         return table
 
@@ -1479,9 +1691,10 @@ class NIMRODAdapter(SimulationAdapter):
         """
         Complex Fourier coefficients of an edges-ml field at (R, Z) points.
 
-        Returns {key: complex array [nmodes, N]} with key = name for scalars
+        Returns {key: complex array [nslots, N]} with key = name for scalars
         and name_R / name_Z / name_phi for vectors (phi component multiplied
-        by PHI_SIGN_FLIP).  The coefficients follow NIMROD's convention:
+        by PHI_SIGN_FLIP).  Index the slot axis with the slot from
+        _mode_table().  The coefficients follow NIMROD's convention:
             field(phi_nimrod) = 2 Re[c e^{i n phi_nimrod}]   (n > 0).
         """
         kind, payload = self._resolve_field(name)
@@ -1538,7 +1751,8 @@ class NIMRODAdapter(SimulationAdapter):
     def _mode_fields_on_grid(self, name, grid_spec, dump_file, imode, n, is_3d,
                              store_complex):
         """
-        Physical perturbation of toroidal mode n on a 2D/3D output grid:
+        Physical perturbation of toroidal mode n (comp slot *imode*) on a
+        2D/3D output grid:
             2 Re[c_n e^{i n phi}]  (n > 0),   Re[c_0]  (n = 0),
         with phi the grid's toroidal angle (NIMROD convention, as used for the
         equilibrium 3D fields; phi = 0 for 2D grids).  Each unique (R, Z) point
@@ -1757,7 +1971,7 @@ class NIMRODAdapter(SimulationAdapter):
         return fc
 
     def _select_mode(self, table, mode_dir, n, imode):
-        """Resolves (mode index, n) from the mode table."""
+        """Resolves (comp slot, n) from the mode table."""
         if imode is not None and n is not None:
             return imode, n
         if n is not None:
@@ -1858,6 +2072,7 @@ class NIMRODAdapter(SimulationAdapter):
                 "code":             self.CODE_NAME,
                 "field":            str(field),
                 "n":                int(n),
+                "comp_slot":        int(imode),
                 "fcoords":          fc.fcoords,
                 "phi":              phit,
                 "toroidal_angle":   "zeta" if apply_omega else "geometric_phi",
