@@ -4,7 +4,9 @@ Flux-aligned (straight-field-line) coordinates for NIMROD equilibria.
 This module is a port of M3D-C1's m3dc1.flux_coordinates.flux_coordinates()
 to an evaluation-agnostic interface: the equilibrium magnetic field is passed
 in as a vectorised callback eval_b(R, Z) -> (B_R, B_Z, B_phi).  It has no
-dependency on nimpy, so it can be tested with analytic fields.
+dependency on nimpy, so it can be tested with analytic fields.  It is used by
+NIMRODAdapter._get_flux_coordinates() to build the grid of the poloidal mode
+spectra.
 
 NIMROD does not provide a poloidal flux function, so psi (relative to the
 magnetic axis) is reconstructed by integrating the equilibrium field along
@@ -18,7 +20,9 @@ B_phi must be supplied in the M3D-C1 toroidal-angle convention.
 Stage 1 (same structure as M3D-C1)
     * poloidal rays at theta_k = 2*pi*k/m (no duplicate end point); theta = 0
       at the outboard midplane, increasing CLOCKWISE in the (R, Z) plane
-      (cos(-theta), sin(-theta));
+      (cos(-theta), sin(-theta)); each ray ends at 99.9 % of the distance to
+      the domain bounding box, or earlier where the field evaluation returns
+      more than two consecutive NaNs (the ray left the domain);
     * radial targets uniform in psi_N, linspace(1e-4, 1, n);
     * psi_N = 1 is the LCFS.  The first estimate is the smallest (over all
       rays) of the largest |psi| reached along each ray.  This equals the
@@ -26,7 +30,7 @@ Stage 1 (same structure as M3D-C1)
       from above for diverted plasmas (along the ray through the X-point the
       flux decreases again inside the private flux region).  The estimate is
       refined with X-points found by a poloidal-field-null finder, and can be
-      overridden.
+      overridden (see "Heuristics" below).
     * on each ray, psi is inverted with the quadratic that is exactly
       consistent with the trapezoidal integration of psi (no additional field
       evaluations are needed).
@@ -50,6 +54,16 @@ The geometric poloidal angle is available as an explicit fallback only.
 
 For 'lin' (cylindrical) geometry I = B_phi and R -> 1 are used, so that
 q = (1/L) * closed-integral(B_phi / Bp dl) is the cylindrical safety factor.
+
+Heuristics (X-point / LCFS search)
+    * automatic X-point guesses: the |Bp| minimum in the upper and in the
+      lower half (relative to the axis), between 35 % and 97 % of each ray's
+      length, accepted if it is below 25 % of the median |Bp|;
+    * a null returned by find_null() is accepted if it lies farther than 10 %
+      of the median ray length from the axis, is not a duplicate, has |Bp|
+      below 5 % of the median |Bp|, psi(X) has the same sign as the edge flux,
+      and |psi(X)| does not exceed the ray estimate;
+    * the accepted candidate with the smallest |psi| defines psi_LCFS.
 """
 
 import numpy as np
@@ -69,11 +83,21 @@ class NimrodFluxCoordinates:
     Flux coordinate system, mirroring the attributes of fpy.flux_coordinates
     that are needed for mode spectra.
 
-    rpath, zpath : [n_theta, n_psi]  (R, Z) of the grid points
-    psi_norm     : [n_psi]           normalised poloidal flux
-    theta        : [n_theta]         2*pi*arange(n_theta)/n_theta
-    q            : [n_psi]           safety factor (M3D-C1 sign convention)
-    omega        : [n_theta, n_psi]  zeta - phi (Boozer / Hamada), or None
+    rpath, zpath      : [n_theta, n_psi]  (R, Z) of the grid points
+    psi_norm          : [n_psi]           normalised poloidal flux
+    theta             : [n_theta]         2*pi*arange(n_theta)/n_theta
+    q                 : [n_psi]           safety factor (M3D-C1 sign convention)
+    fcoords           : str               coordinate system actually used
+    axis              : [2]               magnetic axis (R, Z)
+    psi_lcfs          : float             psi_LCFS - psi_axis (Wb/rad)
+    lcfs_source       : str               which candidate defined psi_lcfs
+    omega             : [n_theta, n_psi]  zeta - phi (Boozer / Hamada), or None
+    n_clipped         : int               uniform-theta points outside the
+                                          theta_sfl range (clipped, quirk 2)
+    n_unreached       : int               (theta, psi) targets not reached
+                                          along their ray (clipped to the end)
+    n_failed_surfaces : int               surfaces with invalid field values
+                                          (kept at their geometric angle)
     """
     rpath: np.ndarray
     zpath: np.ndarray
@@ -116,7 +140,7 @@ def _cumtrapz(y, x):
 
 
 def _ray_lengths(axis, bbox, co, sn, margin=0.999):
-    """Distance from the axis to the bounding box along each ray."""
+    """Distance from the axis to the bounding box along each ray (times *margin*)."""
     rmin, rmax, zmin, zmax = bbox
     r0, z0 = float(axis[0]), float(axis[1])
     with np.errstate(divide='ignore', invalid='ignore'):
@@ -180,9 +204,11 @@ def _cumulative_angle(d, dl):
 
 def _psi_along_rays(eval_b, axis, co, sn, lengths, nrho, torgeom):
     """
-    Evaluates B on all rays at once and integrates psi along each ray.
-    Points are ordered ray by ray, i.e. contiguous along each ray, which keeps
-    logical-coordinate guesses (nimpy EvalGrid) effective.
+    Evaluates B on all rays in a single eval_b() call and integrates psi
+    along each ray.  The points are ordered ray by ray (contiguous along each
+    ray), which helps evaluators that reuse logical-coordinate guesses from
+    the previous point.  (The NIMROD adapter calls nimpy without an EvalGrid
+    cache for this point set.)
     """
     m = co.size
     frac = np.linspace(0.0, 1.0, nrho)
@@ -213,7 +239,10 @@ def _psi_along_rays(eval_b, axis, co, sn, lengths, nrho, torgeom):
 
 
 def _psi_at_point(eval_b, axis, rz, torgeom, nsamp=801):
-    """psi (relative to the axis) at an arbitrary point, by ray integration."""
+    """
+    psi (relative to the axis) at an arbitrary point, by ray integration.
+    Returns NaN if the straight ray from the axis leaves the domain.
+    """
     d = np.asarray(rz[:2], dtype=float) - np.asarray(axis[:2], dtype=float)
     L = float(np.hypot(d[0], d[1]))
     if L <= 0:
@@ -232,7 +261,10 @@ def _psi_at_point(eval_b, axis, rz, torgeom, nsamp=801):
 
 
 def _auto_xpoint_guesses(rays, axis):
-    """Coarse |Bp| minima in the upper and lower half, away from the axis."""
+    """
+    Coarse |Bp| minima in the upper and lower half, away from the axis
+    (35 % - 97 % of the ray length, below 25 % of the median |Bp|).
+    """
     bp, R, Z, last, frac = rays["bp"], rays["R"], rays["Z"], rays["last"], rays["frac"]
     mask = np.zeros(bp.shape, dtype=bool)
     for j, lj in enumerate(last):
@@ -258,6 +290,11 @@ def _determine_psi_lcfs(rays, eval_b, axis, torgeom, find_null,
                         xpoint_guesses, psi_override):
     """
     Returns (psi_lcfs - psi_axis, description of the source).
+
+    Candidates: the ray estimate (smallest over rays of the largest |psi|
+    reached) and the flux at accepted X-points; the smallest |psi| wins.
+    *psi_override* (magnitude) replaces the result; its sign follows the
+    edge flux.
     """
     psi, last = rays["psi"], rays["last"]
     valid = [j for j in range(psi.shape[0]) if last[j] >= 1]
@@ -397,7 +434,8 @@ def _invert_rays(rays, psi_lcfs, targets):
 def _sfl_stage2(r, z, br, bz, bphi, fcoords, torgeom, period, fac):
     """
     Returns (theta_c, theta_pest, q, good) on the Stage-1 grid, where
-    theta_c is the straight-field-line angle of the requested system.
+    theta_c is the straight-field-line angle of the requested system and
+    good[j] is False for surfaces with non-finite angles.
     """
     rp = r if torgeom else np.ones_like(r)
     ix = r * bphi if torgeom else bphi
@@ -473,13 +511,19 @@ def build_flux_coordinates(eval_b: Callable,
     psi_lcfs : float, optional
         Override for psi_LCFS - psi_axis (only the magnitude is used).
     ray_samples : int, optional
-        Samples per ray for the psi integration (default 4 * points).
+        Samples per ray for the psi integration (default 4 * points; at
+        least 50 are always used).
     theta_oversample : int
         Stage-1 oversampling factor in theta (1 = faithful M3D-C1 algorithm).
+        The output always has *points* poloidal points.
     include_omega : bool
         Also return omega = zeta - phi for Boozer / Hamada coordinates.
     verbose : bool
         Print progress notes and warnings.
+
+    Returns
+    -------
+    NimrodFluxCoordinates
     """
     fcoords = normalize_fcoords(fcoords)
     points = int(points)
@@ -546,6 +590,7 @@ def build_flux_coordinates(eval_b: Callable,
         )
 
     want_omega = bool(include_omega) and fcoords in ("boozer", "hamada")
+    # zeta - phi = q * (theta_flux - theta_PEST) along the field lines.
     omega_src = q[None, :] * (theta_c - theta_p) if want_omega else None
 
     rpath = np.empty((points, points))
